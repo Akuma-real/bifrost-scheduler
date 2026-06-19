@@ -486,6 +486,7 @@ func (p virtualProviderConfig) toUpdateRequest() updateProviderConfigRequest {
 		Weight:            p.Weight,
 		AllowedModels:     cloneStrings(p.AllowedModels),
 		BlacklistedModels: cloneStrings(p.BlacklistedModels),
+		AllowAllKeys:      p.AllowAllKeys,
 		KeyIDs:            p.keyIDs(),
 	}
 }
@@ -506,6 +507,7 @@ type updateProviderConfigRequest struct {
 	Weight            *float64 `json:"weight"`
 	AllowedModels     []string `json:"allowed_models,omitempty"`
 	BlacklistedModels []string `json:"blacklisted_models,omitempty"`
+	AllowAllKeys      bool     `json:"allow_all_keys"`
 	KeyIDs            []string `json:"key_ids,omitempty"`
 }
 

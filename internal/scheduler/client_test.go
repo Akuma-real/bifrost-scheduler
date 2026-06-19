@@ -217,9 +217,15 @@ func TestSetProviderWeightPreservesOtherProviderConfigs(t *testing.T) {
 	if len(first.KeyIDs) != 1 || first.KeyIDs[0] != "key-a" {
 		t.Fatalf("first key ids = %+v", first.KeyIDs)
 	}
+	if first.AllowAllKeys {
+		t.Fatalf("first allow_all_keys = true, want false")
+	}
 	second := putPayload.ProviderConfigs[1]
 	if second.ID != 12 || second.Provider != "provider_b" || second.Weight == nil || *second.Weight != 0.2 {
 		t.Fatalf("second provider config = %+v", second)
+	}
+	if !second.AllowAllKeys {
+		t.Fatalf("second allow_all_keys = false, want true")
 	}
 }
 
@@ -259,7 +265,7 @@ func testVirtualKey() map[string]any {
 				"weight":             0.2,
 				"allowed_models":     []string{"gpt-5.5"},
 				"blacklisted_models": []string{},
-				"allow_all_keys":     false,
+				"allow_all_keys":     true,
 				"keys": []any{
 					map[string]any{"id": 102, "key_id": "key-b", "name": "key b", "enabled": false},
 				},

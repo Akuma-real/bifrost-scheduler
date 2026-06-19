@@ -392,11 +392,11 @@ func (p Planner) applyDecision(ctx context.Context, decision Decision, states []
 		}
 		return ApplyResult{Applied: true, Message: "provider keys disabled"}
 	case "disable_provider":
-		if err := p.repo.SetProviderWeight(ctx, state, 0); err != nil {
-			return ApplyResult{Applied: false, Message: err.Error()}
-		}
 		if err := p.repo.SetProviderKeysEnabled(ctx, state, false); err != nil {
-			return ApplyResult{Applied: false, Message: "weight set to zero, but key disable failed: " + err.Error()}
+			return ApplyResult{Applied: false, Message: "key disable failed before weight update: " + err.Error()}
+		}
+		if err := p.repo.SetProviderWeight(ctx, state, 0); err != nil {
+			return ApplyResult{Applied: false, Message: "keys disabled, but weight update failed: " + err.Error()}
 		}
 		return ApplyResult{Applied: true, Message: "provider weight set to zero and keys disabled"}
 	case "review_missing_provider":

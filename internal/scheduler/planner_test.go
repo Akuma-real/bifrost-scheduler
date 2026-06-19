@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -148,7 +149,7 @@ func TestProjectedMinActiveProvidersPreventsClearingWholePool(t *testing.T) {
 	}
 
 	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
-	store := fakeStore{
+	store := &fakeStore{
 		states: []PoolProviderState{
 			{PoolID: "pool_a", VirtualKey: "vk_a", Provider: "provider_a", CurrentWeight: 0.7, CurrentInBifrost: true},
 			{PoolID: "pool_a", VirtualKey: "vk_a", Provider: "provider_b", CurrentWeight: 0.7, CurrentInBifrost: true},
@@ -209,6 +210,65 @@ func TestZeroWeightCriticalProviderRetriesKeyDisable(t *testing.T) {
 	}
 }
 
+func TestDisableProviderDoesNotChangeWeightWhenKeyDisableFails(t *testing.T) {
+	cfg, err := normalizeConfig(Config{
+		Mode:            "guarded_write",
+		MinimumAttempts: 10,
+		Pools: []PoolConfig{
+			{
+				ID:         "pool_a",
+				VirtualKey: "vk_a",
+				Providers: []ProviderConfig{
+					{Name: "provider_a", CostWeight: 0.7},
+					{Name: "provider_b", CostWeight: 0.7},
+				},
+				Rules: &PoolRules{CriticalErrorThreshold: 2, RequiredBadWindows: 2},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("normalizeConfig returned error: %v", err)
+	}
+
+	store := &fakeStore{
+		states: []PoolProviderState{
+			{PoolID: "pool_a", VirtualKey: "vk_a", Provider: "provider_a", CurrentWeight: 0.7, CurrentInBifrost: true},
+			{PoolID: "pool_a", VirtualKey: "vk_a", Provider: "provider_b", CurrentWeight: 0.7, CurrentInBifrost: true},
+		},
+		metrics: []ProviderMetric{
+			{
+				PoolID:                "pool_a",
+				Provider:              "provider_a",
+				Total:                 20,
+				Errors:                20,
+				ErrorRate:             1,
+				CriticalErrors:        2,
+				BadWindows:            2,
+				ConsecutiveBadWindows: 2,
+			},
+			{PoolID: "pool_a", Provider: "provider_b", Total: 20, Success: 20, SuccessRate: 1},
+		},
+		keyErr: fmt.Errorf("no bound keys"),
+	}
+
+	plan, err := NewPlanner(cfg, store, zeroTime()).BuildPlan(context.Background(), true)
+	if err != nil {
+		t.Fatalf("BuildPlan returned error: %v", err)
+	}
+	if len(plan.Decisions) != 1 {
+		t.Fatalf("decisions = %+v, want one decision", plan.Decisions)
+	}
+	if plan.Decisions[0].Action != "disable_provider" || plan.Decisions[0].Apply == nil || plan.Decisions[0].Apply.Applied {
+		t.Fatalf("decision = %+v, want failed disable_provider", plan.Decisions[0])
+	}
+	if store.keyDisableCalls != 1 {
+		t.Fatalf("keyDisableCalls = %d, want 1", store.keyDisableCalls)
+	}
+	if store.weightCalls != 0 {
+		t.Fatalf("weightCalls = %d, want 0", store.weightCalls)
+	}
+}
+
 func TestMissingProviderDoesNotDropBelowMinActiveProviders(t *testing.T) {
 	cfg, err := normalizeConfig(Config{
 		Pools: []PoolConfig{
@@ -225,7 +285,7 @@ func TestMissingProviderDoesNotDropBelowMinActiveProviders(t *testing.T) {
 	}
 
 	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
-	store := fakeStore{
+	store := &fakeStore{
 		states: []PoolProviderState{
 			{PoolID: "pool_a", VirtualKey: "vk_a", Provider: "provider_a", CurrentWeight: 0, CurrentInBifrost: false},
 			{PoolID: "pool_a", VirtualKey: "vk_a", Provider: "provider_b", CurrentWeight: 0.5, CurrentInBifrost: true},
@@ -337,8 +397,12 @@ func zeroTime() time.Time {
 }
 
 type fakeStore struct {
-	states  []PoolProviderState
-	metrics []ProviderMetric
+	states          []PoolProviderState
+	metrics         []ProviderMetric
+	weightCalls     int
+	keyDisableCalls int
+	weightErr       error
+	keyErr          error
 }
 
 func (s fakeStore) LoadProviderStates(_ context.Context, _ []PoolConfig) ([]PoolProviderState, error) {
@@ -349,10 +413,12 @@ func (s fakeStore) LoadMetrics(_ context.Context, _ []PoolConfig, _, _ time.Time
 	return s.metrics, nil
 }
 
-func (s fakeStore) SetProviderWeight(_ context.Context, _ PoolProviderState, _ float64) error {
-	return nil
+func (s *fakeStore) SetProviderWeight(_ context.Context, _ PoolProviderState, _ float64) error {
+	s.weightCalls++
+	return s.weightErr
 }
 
-func (s fakeStore) SetProviderKeysEnabled(_ context.Context, _ PoolProviderState, _ bool) error {
-	return nil
+func (s *fakeStore) SetProviderKeysEnabled(_ context.Context, _ PoolProviderState, _ bool) error {
+	s.keyDisableCalls++
+	return s.keyErr
 }
