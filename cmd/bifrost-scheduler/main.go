@@ -1,0 +1,178 @@
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"log/slog"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/Akuma-real/bifrost-scheduler/internal/scheduler"
+)
+
+func main() {
+	os.Exit(run())
+}
+
+func run() int {
+	if len(os.Args) < 2 {
+		usage()
+		return 2
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	switch os.Args[1] {
+	case "plan":
+		fs := flag.NewFlagSet("plan", flag.ExitOnError)
+		opts := commonFlags(fs)
+		apply := fs.Bool("apply", false, "apply guarded changes; requires config mode guarded_write")
+		_ = fs.Parse(os.Args[2:])
+		return runPlan(ctx, logger, *opts, *apply)
+	case "daemon":
+		fs := flag.NewFlagSet("daemon", flag.ExitOnError)
+		opts := commonFlags(fs)
+		apply := fs.Bool("apply", false, "apply guarded changes on each interval; requires config mode guarded_write")
+		interval := fs.Duration("interval", envDuration("BIFROST_SCHEDULER_INTERVAL", 5*time.Minute), "run interval")
+		_ = fs.Parse(os.Args[2:])
+		return runDaemon(ctx, logger, *opts, *interval, *apply)
+	case "version":
+		fmt.Println("bifrost-scheduler dev")
+		return 0
+	default:
+		usage()
+		return 2
+	}
+}
+
+type options struct {
+	ConfigPath  string
+	APIURL      string
+	APIUsername string
+	APIPassword string
+	APITimeout  time.Duration
+	Format      string
+}
+
+func commonFlags(fs *flag.FlagSet) *options {
+	opts := &options{}
+	fs.StringVar(&opts.ConfigPath, "config", envDefault("BIFROST_SCHEDULER_CONFIG", "config.example.json"), "scheduler config JSON path")
+	fs.StringVar(&opts.APIURL, "api-url", os.Getenv("BIFROST_API_URL"), "Bifrost API base URL")
+	fs.StringVar(&opts.APIUsername, "api-username", os.Getenv("BIFROST_API_USERNAME"), "Bifrost dashboard/admin username")
+	fs.StringVar(&opts.APIPassword, "api-password", os.Getenv("BIFROST_API_PASSWORD"), "Bifrost dashboard/admin password")
+	fs.DurationVar(&opts.APITimeout, "api-timeout", envDuration("BIFROST_API_TIMEOUT", 30*time.Second), "Bifrost API request timeout")
+	fs.StringVar(&opts.Format, "format", envDefault("BIFROST_SCHEDULER_FORMAT", "markdown"), "output format: markdown or json")
+	return opts
+}
+
+func runPlan(ctx context.Context, logger *slog.Logger, opts options, apply bool) int {
+	plan, err := buildPlan(ctx, opts, apply)
+	if err != nil {
+		logger.Error("plan failed", "error", err)
+		return 1
+	}
+	if err := scheduler.WritePlan(os.Stdout, plan, opts.Format); err != nil {
+		logger.Error("write plan failed", "error", err)
+		return 1
+	}
+	if hasCritical(plan) {
+		return 10
+	}
+	return 0
+}
+
+func runDaemon(ctx context.Context, logger *slog.Logger, opts options, interval time.Duration, apply bool) int {
+	if interval <= 0 {
+		logger.Error("interval must be positive", "interval", interval.String())
+		return 2
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		plan, err := buildPlan(ctx, opts, apply)
+		if err != nil {
+			logger.Error("plan failed", "error", err)
+		} else if err := scheduler.WritePlan(os.Stdout, plan, opts.Format); err != nil {
+			logger.Error("write plan failed", "error", err)
+		}
+
+		select {
+		case <-ctx.Done():
+			logger.Info("daemon stopped")
+			return 0
+		case <-ticker.C:
+		}
+	}
+}
+
+func buildPlan(ctx context.Context, opts options, apply bool) (scheduler.Plan, error) {
+	cfg, err := scheduler.LoadConfig(opts.ConfigPath)
+	if err != nil {
+		return scheduler.Plan{}, err
+	}
+	apiURL := opts.APIURL
+	if apiURL == "" {
+		apiURL = cfg.API.BaseURL
+	}
+	client, err := scheduler.NewBifrostClient(scheduler.ClientOptions{
+		BaseURL:  apiURL,
+		Username: opts.APIUsername,
+		Password: opts.APIPassword,
+		Paths:    cfg.API.Paths,
+		Timeout:  opts.APITimeout,
+	})
+	if err != nil {
+		return scheduler.Plan{}, err
+	}
+	defer client.Close()
+	if err := client.Login(ctx); err != nil {
+		return scheduler.Plan{}, err
+	}
+
+	planner := scheduler.NewPlanner(cfg, client, time.Now())
+	return planner.BuildPlan(ctx, apply)
+}
+
+func hasCritical(plan scheduler.Plan) bool {
+	for _, decision := range plan.Decisions {
+		if decision.Severity == "critical" {
+			return true
+		}
+	}
+	return false
+}
+
+func usage() {
+	fmt.Fprint(os.Stderr, `usage: bifrost-scheduler <command> [flags]
+
+commands:
+  plan     Build a dry-run scheduler plan. Add --apply only with guarded_write config.
+  daemon   Run the scheduler plan loop.
+  version  Print version.
+`)
+}
+
+func envDefault(key, fallback string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return fallback
+}
+
+func envDuration(key string, fallback time.Duration) time.Duration {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}

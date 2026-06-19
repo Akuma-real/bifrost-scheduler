@@ -1,0 +1,46 @@
+{
+  "mode": "read_only",
+  "api": {
+    "base_url": "https://example-bifrost.internal"
+  },
+  "pools": [
+    {
+      "id": "text_low",
+      "virtual_key": "text_low",
+      "providers": [
+        {
+          "name": "provider_a",
+          "cost_weight": 1
+        },
+        {
+          "name": "provider_b",
+          "cost_weight": 0.5
+        },
+        {
+          "name": "new_provider_c",
+          "role": "candidate",
+          "cost_weight": 0.2,
+          "min_weight": 0.05
+        },
+        {
+          "name": "disabled_provider_d",
+          "role": "quarantine"
+        }
+      ]
+    },
+    {
+      "id": "text_stable",
+      "virtual_key": "text_stable",
+      "providers": [
+        {
+          "name": "provider_e",
+          "cost_weight": 0.8
+        },
+        {
+          "name": "provider_f",
+          "cost_weight": 0.4
+        }
+      ]
+    }
+  ]
+}

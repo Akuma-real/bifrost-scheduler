@@ -1,0 +1,6 @@
+.git
+.cache
+.env
+dist
+bifrost-scheduler
+*.log

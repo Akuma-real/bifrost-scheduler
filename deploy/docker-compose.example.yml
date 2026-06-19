@@ -1,0 +1,17 @@
+services:
+  bifrost-scheduler:
+    image: ghcr.io/akuma-real/bifrost-scheduler:latest
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./config.json:/app/config.json:ro
+    command:
+      - daemon
+      - --config
+      - /app/config.json
+      - --interval
+      - 5m
+    read_only: true
+    security_opt:
+      - no-new-privileges:true

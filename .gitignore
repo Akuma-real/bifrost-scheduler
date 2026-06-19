@@ -1,0 +1,6 @@
+.cache/
+.env
+config.json
+dist/
+/bifrost-scheduler
+*.log
