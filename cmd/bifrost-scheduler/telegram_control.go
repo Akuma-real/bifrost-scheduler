@@ -8,6 +8,7 @@ package main
 //
 // context：控制后台轮询什么时候停止。
 // fmt：格式化回复文本。
+// html：转义 Telegram HTML 富文本里的运行时文本。
 // log/slog：写结构化日志。
 // strings：处理 /status、/mute 1h 这类文本命令。
 // sync：用 Mutex 保护 daemonState，避免多个 goroutine 同时读写出错。
@@ -17,6 +18,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"html"
 	"log/slog"
 	"strings"
 	"sync"
@@ -270,6 +272,11 @@ func (c telegramControl) handleCommand(ctx context.Context, raw string) {
 		return
 	}
 
+	// Telegram 客户端里的“正在输入...”只会持续几秒。
+	// 对 /run 这种要等待 Bifrost API 的命令，后台循环会每隔几秒补一次 typing。
+	stopTyping := c.startTyping(ctx)
+	defer stopTyping()
+
 	switch command {
 	case "/start", "/help", "help":
 		c.reply(ctx, helpText(), mainKeyboard())
@@ -297,7 +304,7 @@ func (c telegramControl) runDryPlan(ctx context.Context) {
 	plan, err := buildPlan(ctx, c.opts, false)
 	if err != nil {
 		c.state.recordError(err)
-		c.reply(ctx, "手动 dry-run 失败：\n"+err.Error(), mainKeyboard())
+		c.reply(ctx, "<b>手动 dry-run 失败</b>\n\n<code>"+html.EscapeString(err.Error())+"</code>", mainKeyboard())
 		return
 	}
 	c.state.recordPlan(plan)
@@ -310,19 +317,54 @@ func (c telegramControl) mute(ctx context.Context, arg string) {
 	if strings.TrimSpace(arg) != "" {
 		parsed, err := time.ParseDuration(strings.TrimSpace(arg))
 		if err != nil || parsed <= 0 {
-			c.reply(ctx, "静音时长格式不对。例子：/mute 30m 或 /mute 2h", mainKeyboard())
+			c.reply(ctx, "静音时长格式不对。例子：<code>/mute 30m</code> 或 <code>/mute 2h</code>", mainKeyboard())
 			return
 		}
 		duration = parsed
 	}
 	c.state.muteFor(duration)
-	c.reply(ctx, fmt.Sprintf("已静音 Telegram 变更通知 %s。调度器仍会继续运行。", duration), mainKeyboard())
+	c.reply(ctx, fmt.Sprintf("已静音 Telegram 变更通知 <code>%s</code>。调度器仍会继续运行。", html.EscapeString(duration.String())), mainKeyboard())
 }
 
-// reply 发送 Telegram 回复。
+// reply 发送 Telegram HTML 富文本回复。
 func (c telegramControl) reply(ctx context.Context, text string, keyboard [][]notify.TelegramInlineButton) {
-	if err := c.notifier.SendTextWithKeyboard(ctx, text, keyboard); err != nil {
+	if err := c.notifier.SendHTMLWithKeyboard(ctx, text, keyboard); err != nil {
 		c.logger.Error("telegram reply failed", "error", err)
+	}
+}
+
+// startTyping 启动 Telegram “正在输入...”提示。
+//
+// 返回的 stop 函数用于停止后台循环。
+func (c telegramControl) startTyping(ctx context.Context) func() {
+	typingCtx, cancel := context.WithCancel(ctx)
+	send := func() {
+		if err := c.notifier.SendChatAction(typingCtx, notify.TelegramActionTyping); err != nil && typingCtx.Err() == nil {
+			c.logger.Error("telegram typing action failed", "error", err)
+		}
+	}
+
+	// 先立即发一次，避免用户点了按钮后看起来没有任何反应。
+	send()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(4 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-typingCtx.Done():
+				return
+			case <-ticker.C:
+				send()
+			}
+		}
+	}()
+
+	return func() {
+		cancel()
+		<-done
 	}
 }
 
@@ -377,18 +419,18 @@ func mainKeyboard() [][]notify.TelegramInlineButton {
 // helpText 返回帮助文本。
 func helpText() string {
 	return strings.TrimSpace(`
-Bifrost 调度器 Telegram 控制台
+<b>Bifrost 调度器 Telegram 控制台</b>
 
 可用命令：
-/status - 查看 daemon 是否运行、多久跑一次、最近是否报错
-/last - 查看最近一次调度摘要
-/run - 立即执行一次 dry-run 预览，不写线上
-/mute 1h - 静音变更通知，调度器仍继续运行
-/unmute - 恢复变更通知
-/help - 查看帮助
+<code>/status</code> - 查看 daemon 是否运行、多久跑一次、最近是否报错
+<code>/last</code> - 查看最近一次调度摘要
+<code>/run</code> - 立即执行一次 dry-run 预览，不写线上
+<code>/mute 1h</code> - 静音变更通知，调度器仍继续运行
+<code>/unmute</code> - 恢复变更通知
+<code>/help</code> - 查看帮助
 
 安全边界：
-Telegram 交互不提供直接写线上命令。自动写入仍只由 daemon 的 config mode 和 --apply 控制。
+Telegram 交互不提供直接写线上命令。自动写入仍只由 daemon 的 <code>config mode</code> 和 <code>--apply</code> 控制。
 `)
 }
 
@@ -418,22 +460,22 @@ func statusText(snapshot daemonSnapshot) string {
 	}
 
 	return fmt.Sprintf(
-		"Bifrost 调度器状态\n\n启动时间：%s\n运行模式：%s\n实际写入开关：%t\n运行间隔：%s\n最近运行：%s\n最近决策数：%d\n通知静音：%s\n最近错误：%s",
-		snapshot.startedAt.Format(time.RFC3339),
-		mode,
+		"<b>Bifrost 调度器状态</b>\n\n启动时间：<code>%s</code>\n运行模式：<code>%s</code>\n实际写入开关：<b>%t</b>\n运行间隔：<code>%s</code>\n最近运行：<code>%s</code>\n最近决策数：<b>%d</b>\n通知静音：%s\n最近错误：<code>%s</code>",
+		html.EscapeString(snapshot.startedAt.Format(time.RFC3339)),
+		html.EscapeString(mode),
 		applyEnabled,
-		snapshot.interval,
-		lastRun,
+		html.EscapeString(snapshot.interval.String()),
+		html.EscapeString(lastRun),
 		decisions,
-		muted,
-		lastError,
+		html.EscapeString(muted),
+		html.EscapeString(lastError),
 	)
 }
 
 // lastPlanText 把最近计划压缩成 Telegram 文本。
 func lastPlanText(snapshot daemonSnapshot) string {
 	if snapshot.lastPlan == nil {
-		return "还没有最近计划。可以点“立即 dry-run”或发送 /run 先跑一次预览。"
+		return "还没有最近计划。可以点“立即 dry-run”或发送 <code>/run</code> 先跑一次预览。"
 	}
 	return planSummaryText("最近一次调度计划", *snapshot.lastPlan)
 }
@@ -450,11 +492,11 @@ func planSummaryText(title string, plan domain.Plan) string {
 	if plan.ApplyEnabled {
 		status = "会写线上"
 	}
-	fmt.Fprintf(&b, "%s\n\n时间：%s\n模式：%s\n执行：%s\n决策数：%d\n",
-		title,
-		plan.GeneratedAt.Format(time.RFC3339),
-		plan.Mode,
-		status,
+	fmt.Fprintf(&b, "<b>%s</b>\n\n时间：<code>%s</code>\n模式：<code>%s</code>\n执行：<b>%s</b>\n决策数：<b>%d</b>\n",
+		html.EscapeString(title),
+		html.EscapeString(plan.GeneratedAt.Format(time.RFC3339)),
+		html.EscapeString(plan.Mode),
+		html.EscapeString(status),
 		len(plan.Decisions),
 	)
 	if len(plan.Decisions) == 0 {
@@ -466,10 +508,18 @@ func planSummaryText(title string, plan domain.Plan) string {
 			fmt.Fprintf(&b, "\n...还有 %d 个动作，完整内容见日志。", len(plan.Decisions)-i)
 			break
 		}
-		fmt.Fprintf(&b, "\n%d. %s / %s\n", i+1, decision.PoolID, decision.Provider)
-		fmt.Fprintf(&b, "   %s：%.4f -> %.4f\n", decision.Action, decision.CurrentWeight, decision.TargetWeight)
+		fmt.Fprintf(&b, "\n%d. <code>%s</code> / <code>%s</code>\n",
+			i+1,
+			html.EscapeString(decision.PoolID),
+			html.EscapeString(decision.Provider),
+		)
+		fmt.Fprintf(&b, "   <code>%s</code>：<code>%.4f</code> -&gt; <code>%.4f</code>\n",
+			html.EscapeString(decision.Action),
+			decision.CurrentWeight,
+			decision.TargetWeight,
+		)
 		if decision.Reason != "" {
-			fmt.Fprintf(&b, "   %s\n", decision.Reason)
+			fmt.Fprintf(&b, "   %s\n", html.EscapeString(decision.Reason))
 		}
 	}
 	return b.String()

@@ -164,6 +164,8 @@ BIFROST_SCHEDULER_TG_INTERACTIVE=true
 
 Telegram 交互控制台只在 `daemon` 模式下生效，使用 Telegram `getUpdates` 长轮询，不需要 webhook，也不需要开放公网端口。为了安全，只有 `BIFROST_SCHEDULER_TG_CHAT_ID` 配置的 chat 可以操作。
 
+交互回复会使用 Telegram HTML 富文本显示粗体和等宽代码；执行 `/run` 等需要等待 Bifrost API 的命令时，bot 会先显示“正在输入...”，避免看起来像没反应。
+
 可用命令：
 
 ```text

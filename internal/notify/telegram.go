@@ -11,6 +11,7 @@ package notify
 // crypto/sha256、encoding/hex：给计划生成稳定指纹，用于 daemon 去重。
 // encoding/json：编码 Telegram 请求和解析响应。
 // fmt：格式化错误和消息。
+// html：转义 Telegram HTML 富文本里的用户/运行时文本。
 // io：读取 Telegram 错误响应体。
 // net/http：发送 Telegram Bot API 请求。
 // sort：让指纹生成顺序稳定。
@@ -25,6 +26,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"sort"
@@ -34,6 +36,13 @@ import (
 
 	domain "github.com/Akuma-real/bifrost-scheduler/internal/domain/scheduler"
 	"github.com/Akuma-real/bifrost-scheduler/internal/report"
+)
+
+const (
+	// TelegramParseHTML 表示 Telegram sendMessage 使用 HTML 富文本。
+	TelegramParseHTML = "HTML"
+	// TelegramActionTyping 表示 Telegram 顶部显示“正在输入...”。
+	TelegramActionTyping = "typing"
 )
 
 // TelegramConfig 是 Telegram 通知配置。
@@ -170,8 +179,8 @@ func (n *TelegramNotifier) NotifyPlan(ctx context.Context, plan domain.Plan) err
 	if n == nil || len(plan.Decisions) == 0 {
 		return nil
 	}
-	text := FormatPlanMessage(plan)
-	return n.SendText(ctx, text)
+	text := FormatPlanHTMLMessage(plan)
+	return n.SendHTML(ctx, text)
 }
 
 // SendText 发送一条普通 Telegram 文本消息。
@@ -179,14 +188,46 @@ func (n *TelegramNotifier) SendText(ctx context.Context, text string) error {
 	return n.SendTextWithKeyboard(ctx, text, nil)
 }
 
+// SendHTML 发送一条 Telegram HTML 富文本消息。
+func (n *TelegramNotifier) SendHTML(ctx context.Context, text string) error {
+	return n.SendHTMLWithKeyboard(ctx, text, nil)
+}
+
 // SendTextWithKeyboard 发送文本消息，并可选带一组内联按钮。
 //
 // keyboard 是二维切片：外层是一行一行按钮，内层是同一行里的多个按钮。
 func (n *TelegramNotifier) SendTextWithKeyboard(ctx context.Context, text string, keyboard [][]TelegramInlineButton) error {
+	return n.sendMessage(ctx, text, "", keyboard)
+}
+
+// SendHTMLWithKeyboard 发送 Telegram HTML 富文本，并可选带按钮。
+func (n *TelegramNotifier) SendHTMLWithKeyboard(ctx context.Context, text string, keyboard [][]TelegramInlineButton) error {
+	return n.sendMessage(ctx, text, TelegramParseHTML, keyboard)
+}
+
+// SendChatAction 调用 Telegram sendChatAction。
+//
+// action 常用值是 typing，客户端会显示“正在输入...”。
+func (n *TelegramNotifier) SendChatAction(ctx context.Context, action string) error {
+	payload := telegramSendChatActionRequest{
+		ChatID: n.chatID,
+		Action: action,
+	}
+	if n.threadID > 0 {
+		payload.MessageThreadID = n.threadID
+	}
+	return n.postTelegram(ctx, "sendChatAction", payload, nil)
+}
+
+// sendMessage 是 sendMessage 的内部实现。
+func (n *TelegramNotifier) sendMessage(ctx context.Context, text, parseMode string, keyboard [][]TelegramInlineButton) error {
 	payload := telegramSendMessageRequest{
 		ChatID:                n.chatID,
 		Text:                  text,
 		DisableWebPagePreview: true,
+	}
+	if parseMode != "" {
+		payload.ParseMode = parseMode
 	}
 	if n.threadID > 0 {
 		payload.MessageThreadID = n.threadID
@@ -331,6 +372,84 @@ func FormatPlanMessage(plan domain.Plan) string {
 	return truncateTelegramText(b.String())
 }
 
+// FormatPlanHTMLMessage 把调度计划压缩成 Telegram HTML 富文本。
+//
+// 注意：运行时字符串必须用 html.EscapeString 转义。
+// 否则 provider 名或错误原因里如果有 < > &，Telegram 会把整条消息判为非法 HTML。
+func FormatPlanHTMLMessage(plan domain.Plan) string {
+	var b strings.Builder
+	status := "不会写线上"
+	if plan.ApplyEnabled {
+		status = "会写线上"
+	}
+
+	fmt.Fprintf(&b, "<b>Bifrost 调度器发现 %d 个变更</b>\n", len(plan.Decisions))
+	fmt.Fprintf(&b, "模式：<code>%s</code>；执行：<b>%s</b>\n", escapeTelegramHTML(plan.Mode), escapeTelegramHTML(status))
+	fmt.Fprintf(&b, "时间：<code>%s</code>\n", escapeTelegramHTML(plan.GeneratedAt.Format(time.RFC3339)))
+
+	for i, decision := range plan.Decisions {
+		if i >= 8 {
+			fmt.Fprintf(&b, "\n...还有 %d 个动作，完整内容见调度器日志。\n", len(plan.Decisions)-i)
+			break
+		}
+		fmt.Fprintf(&b, "\n%d. <b>[%s]</b> %s\n",
+			i+1,
+			escapeTelegramHTML(decision.Severity),
+			formatDecisionHTMLSummary(decision),
+		)
+		fmt.Fprintf(&b, "   <code>%s</code> / <code>%s</code>\n",
+			escapeTelegramHTML(decision.PoolID),
+			escapeTelegramHTML(decision.Provider),
+		)
+		fmt.Fprintf(&b, "   权重：<code>%.4f</code> -&gt; <code>%.4f</code>\n", decision.CurrentWeight, decision.TargetWeight)
+		if decision.Apply != nil {
+			fmt.Fprintf(&b, "   执行：%s\n", html.EscapeString(applyText(*decision.Apply)))
+		} else if decision.DryRun {
+			fmt.Fprintf(&b, "   执行：未执行，只预览\n")
+		}
+		if decision.Reason != "" {
+			fmt.Fprintf(&b, "   原因：%s\n", escapeTelegramHTMLShort(decision.Reason, 500))
+		}
+	}
+
+	return truncateTelegramHTMLText(b.String())
+}
+
+// formatDecisionHTMLSummary 把动作摘要渲染成 Telegram HTML。
+func formatDecisionHTMLSummary(d domain.Decision) string {
+	provider := "<code>" + escapeTelegramHTML(d.Provider) + "</code>"
+	switch d.Action {
+	case "set_weight_zero":
+		return "把 " + provider + " 的权重清零"
+	case "set_weight":
+		if domain.WeightsEqual(d.TargetWeight, d.CurrentWeight) {
+			return fmt.Sprintf("保持 %s 的权重为 <code>%.4f</code>", provider, d.TargetWeight)
+		}
+		if d.TargetWeight > d.CurrentWeight {
+			return fmt.Sprintf("把 %s 的权重提高到 <code>%.4f</code>", provider, d.TargetWeight)
+		}
+		return fmt.Sprintf("把 %s 的权重降到 <code>%.4f</code>", provider, d.TargetWeight)
+	case "disable_provider":
+		return "禁用 " + provider + "：权重清零，并禁用绑定 key"
+	case "disable_provider_keys":
+		return "继续禁用 " + provider + " 的绑定 key"
+	case "review_missing_provider":
+		return "人工检查 " + provider + "：配置里有，但 Bifrost VK 中缺失"
+	default:
+		return "对 " + provider + " 执行动作 <code>" + escapeTelegramHTML(d.Action) + "</code>"
+	}
+}
+
+// escapeTelegramHTML 转义 Telegram HTML 里的运行时文本。
+func escapeTelegramHTML(text string) string {
+	return html.EscapeString(text)
+}
+
+// escapeTelegramHTMLShort 先安全截断普通文本，再转义成 Telegram HTML。
+func escapeTelegramHTMLShort(text string, maxRunes int) string {
+	return html.EscapeString(truncatePlainText(text, maxRunes))
+}
+
 // Fingerprint 给本轮决策生成稳定指纹。
 //
 // daemon 可以用它判断“这轮变更是否和上一轮完全一样”，避免重复刷屏。
@@ -375,6 +494,33 @@ func truncateTelegramText(text string) string {
 	return string(runes[:maxRunes]) + "\n\n...已截断，完整报告见调度器日志。"
 }
 
+// truncateTelegramHTMLText 避免 HTML 消息超过 Telegram 限制。
+//
+// 不能直接截断 HTML 字符串，因为可能截在 <code> 这种标签中间。
+// 如果真的超长，就退化成一条短 HTML 消息，让发送一定成功。
+func truncateTelegramHTMLText(text string) string {
+	const maxRunes = 3900
+	if len([]rune(text)) <= maxRunes {
+		return text
+	}
+	return "<b>Bifrost 调度器发现变更</b>\n\n消息太长，完整报告见调度器日志。"
+}
+
+// truncatePlainText 截断普通文本，并追加省略说明。
+func truncatePlainText(text string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return ""
+	}
+	runes := []rune(text)
+	if len(runes) <= maxRunes {
+		return text
+	}
+	if maxRunes <= 4 {
+		return string(runes[:maxRunes])
+	}
+	return string(runes[:maxRunes-4]) + " ..."
+}
+
 // redactToken 从错误文本里隐藏 bot token。
 func redactToken(text, token string) string {
 	if token == "" {
@@ -388,8 +534,16 @@ type telegramSendMessageRequest struct {
 	ChatID                string                        `json:"chat_id"`
 	MessageThreadID       int                           `json:"message_thread_id,omitempty"`
 	Text                  string                        `json:"text"`
+	ParseMode             string                        `json:"parse_mode,omitempty"`
 	DisableWebPagePreview bool                          `json:"disable_web_page_preview"`
 	ReplyMarkup           *telegramInlineKeyboardMarkup `json:"reply_markup,omitempty"`
+}
+
+// telegramSendChatActionRequest 是 sendChatAction 的请求体。
+type telegramSendChatActionRequest struct {
+	ChatID          string `json:"chat_id"`
+	MessageThreadID int    `json:"message_thread_id,omitempty"`
+	Action          string `json:"action"`
 }
 
 // telegramResponse 是 Telegram Bot API 的通用响应结构。

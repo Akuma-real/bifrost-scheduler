@@ -88,18 +88,18 @@ func TestStatusAndLastPlanText(t *testing.T) {
 	})
 
 	status := statusText(state.snapshot())
-	if !strings.Contains(status, "Bifrost 调度器状态") {
+	if !strings.Contains(status, "<b>Bifrost 调度器状态</b>") {
 		t.Fatalf("status text = %q, want title", status)
 	}
-	if !strings.Contains(status, "运行间隔：5m0s") {
+	if !strings.Contains(status, "运行间隔：<code>5m0s</code>") {
 		t.Fatalf("status text = %q, want interval", status)
 	}
 
 	last := lastPlanText(state.snapshot())
-	if !strings.Contains(last, "最近一次调度计划") {
+	if !strings.Contains(last, "<b>最近一次调度计划</b>") {
 		t.Fatalf("last text = %q, want title", last)
 	}
-	if !strings.Contains(last, "provider_b") {
+	if !strings.Contains(last, "<code>provider_b</code>") {
 		t.Fatalf("last text = %q, want provider name", last)
 	}
 }

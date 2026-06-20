@@ -80,10 +80,13 @@ func TestTelegramNotifierSendsPlanDecision(t *testing.T) {
 	if captured.MessageThreadID != 456 {
 		t.Fatalf("message_thread_id = %d, want 456", captured.MessageThreadID)
 	}
-	if !strings.Contains(captured.Text, "Bifrost 调度器发现 1 个变更") {
+	if captured.ParseMode != TelegramParseHTML {
+		t.Fatalf("parse_mode = %q, want HTML", captured.ParseMode)
+	}
+	if !strings.Contains(captured.Text, "<b>Bifrost 调度器发现 1 个变更</b>") {
 		t.Fatalf("telegram text = %q, want change summary", captured.Text)
 	}
-	if !strings.Contains(captured.Text, "把 `provider_a` 的权重降到 0.0500") {
+	if !strings.Contains(captured.Text, "把 <code>provider_a</code> 的权重降到 <code>0.0500</code>") {
 		t.Fatalf("telegram text = %q, want human decision summary", captured.Text)
 	}
 }
@@ -146,6 +149,91 @@ func TestTelegramNotifierSendsKeyboard(t *testing.T) {
 	}
 	if captured.ReplyMarkup.InlineKeyboard[0][0].CallbackData != "status" {
 		t.Fatalf("callback_data = %q, want status", captured.ReplyMarkup.InlineKeyboard[0][0].CallbackData)
+	}
+}
+
+// TestTelegramNotifierSendsHTMLWithKeyboard 验证 HTML 富文本消息会带 parse_mode。
+func TestTelegramNotifierSendsHTMLWithKeyboard(t *testing.T) {
+	var captured telegramSendMessageRequest
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+			t.Fatalf("decode telegram payload: %v", err)
+		}
+		return jsonResponse(map[string]any{"ok": true}), nil
+	})}
+
+	notifier, err := NewTelegramNotifier(TelegramConfig{
+		BotToken:   "123456:ABC",
+		ChatID:     "1926854736",
+		HTTPClient: client,
+	})
+	if err != nil {
+		t.Fatalf("NewTelegramNotifier returned error: %v", err)
+	}
+
+	err = notifier.SendHTMLWithKeyboard(context.Background(), "<b>hello</b>", [][]TelegramInlineButton{
+		{{Text: "状态", CallbackData: "status"}},
+	})
+	if err != nil {
+		t.Fatalf("SendHTMLWithKeyboard returned error: %v", err)
+	}
+	if captured.ParseMode != TelegramParseHTML {
+		t.Fatalf("parse_mode = %q, want HTML", captured.ParseMode)
+	}
+	if captured.ReplyMarkup == nil {
+		t.Fatalf("reply_markup is nil, want inline keyboard")
+	}
+}
+
+// TestTelegramNotifierSendChatAction 验证 typing 状态会调用 sendChatAction。
+func TestTelegramNotifierSendChatAction(t *testing.T) {
+	var captured telegramSendChatActionRequest
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if !strings.Contains(r.URL.Path, "/sendChatAction") {
+			t.Fatalf("path = %s, want sendChatAction", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+			t.Fatalf("decode sendChatAction payload: %v", err)
+		}
+		return jsonResponse(map[string]any{"ok": true}), nil
+	})}
+
+	notifier, err := NewTelegramNotifier(TelegramConfig{
+		BotToken:   "123456:ABC",
+		ChatID:     "1926854736",
+		ThreadID:   "456",
+		HTTPClient: client,
+	})
+	if err != nil {
+		t.Fatalf("NewTelegramNotifier returned error: %v", err)
+	}
+
+	if err := notifier.SendChatAction(context.Background(), TelegramActionTyping); err != nil {
+		t.Fatalf("SendChatAction returned error: %v", err)
+	}
+	if captured.ChatID != "1926854736" {
+		t.Fatalf("chat_id = %q, want 1926854736", captured.ChatID)
+	}
+	if captured.MessageThreadID != 456 {
+		t.Fatalf("thread id = %d, want 456", captured.MessageThreadID)
+	}
+	if captured.Action != TelegramActionTyping {
+		t.Fatalf("action = %q, want typing", captured.Action)
+	}
+}
+
+// TestFormatPlanHTMLMessageEscapesRuntimeText 验证 HTML 消息会转义运行时文本。
+func TestFormatPlanHTMLMessageEscapesRuntimeText(t *testing.T) {
+	plan := samplePlan()
+	plan.Decisions[0].Provider = "provider_<a>&b"
+	plan.Decisions[0].Reason = "bad <token> & retry"
+
+	text := FormatPlanHTMLMessage(plan)
+	if !strings.Contains(text, "provider_&lt;a&gt;&amp;b") {
+		t.Fatalf("html text = %q, want escaped provider", text)
+	}
+	if !strings.Contains(text, "bad &lt;token&gt; &amp; retry") {
+		t.Fatalf("html text = %q, want escaped reason", text)
 	}
 }
 
