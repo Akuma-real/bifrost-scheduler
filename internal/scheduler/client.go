@@ -488,6 +488,7 @@ func (p virtualProviderConfig) toUpdateRequest() updateProviderConfigRequest {
 		BlacklistedModels: cloneStrings(p.BlacklistedModels),
 		AllowAllKeys:      p.AllowAllKeys,
 		KeyIDs:            p.keyIDs(),
+		SelectedKeyIDs:    p.keyIDs(),
 	}
 }
 
@@ -509,6 +510,7 @@ type updateProviderConfigRequest struct {
 	BlacklistedModels []string `json:"blacklisted_models,omitempty"`
 	AllowAllKeys      bool     `json:"allow_all_keys"`
 	KeyIDs            []string `json:"key_ids,omitempty"`
+	SelectedKeyIDs    []string `json:"selected_key_ids,omitempty"`
 }
 
 type searchLogsResponse struct {

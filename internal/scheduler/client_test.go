@@ -217,6 +217,9 @@ func TestSetProviderWeightPreservesOtherProviderConfigs(t *testing.T) {
 	if len(first.KeyIDs) != 1 || first.KeyIDs[0] != "key-a" {
 		t.Fatalf("first key ids = %+v", first.KeyIDs)
 	}
+	if len(first.SelectedKeyIDs) != 1 || first.SelectedKeyIDs[0] != "key-a" {
+		t.Fatalf("first selected key ids = %+v", first.SelectedKeyIDs)
+	}
 	if first.AllowAllKeys {
 		t.Fatalf("first allow_all_keys = true, want false")
 	}
@@ -226,6 +229,9 @@ func TestSetProviderWeightPreservesOtherProviderConfigs(t *testing.T) {
 	}
 	if !second.AllowAllKeys {
 		t.Fatalf("second allow_all_keys = false, want true")
+	}
+	if len(second.SelectedKeyIDs) != 1 || second.SelectedKeyIDs[0] != "key-b" {
+		t.Fatalf("second selected key ids = %+v", second.SelectedKeyIDs)
 	}
 }
 
