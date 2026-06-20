@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -158,6 +159,8 @@ type options struct {
 	TelegramChatID string
 	// TelegramThreadID 是 Telegram 群组话题 ID，可选。
 	TelegramThreadID string
+	// TelegramInteractive 表示是否启用 Telegram 交互指令。
+	TelegramInteractive bool
 }
 
 // commonFlags 定义 plan 和 daemon 两个命令共用的参数。
@@ -199,6 +202,7 @@ func commonFlags(fs *flag.FlagSet) *options {
 	fs.StringVar(&opts.TelegramBotToken, "telegram-bot-token", os.Getenv("BIFROST_SCHEDULER_TG_BOT_TOKEN"), "Telegram bot token for change notifications")
 	fs.StringVar(&opts.TelegramChatID, "telegram-chat-id", os.Getenv("BIFROST_SCHEDULER_TG_CHAT_ID"), "Telegram chat id for change notifications")
 	fs.StringVar(&opts.TelegramThreadID, "telegram-thread-id", os.Getenv("BIFROST_SCHEDULER_TG_THREAD_ID"), "optional Telegram forum topic thread id")
+	fs.BoolVar(&opts.TelegramInteractive, "telegram-interactive", envBool("BIFROST_SCHEDULER_TG_INTERACTIVE", false), "enable Telegram bot commands in daemon mode")
 	return opts
 }
 
@@ -273,18 +277,35 @@ func runDaemon(ctx context.Context, logger *slog.Logger, opts options, interval 
 	// 如果下一轮仍然是完全相同的变更，就不重复通知。
 	lastNotificationFingerprint := ""
 
+	// daemonState 保存 daemon 最近一次运行结果。
+	// Telegram 交互指令会读取它来回答 /status 和 /last。
+	state := newDaemonState(interval, apply)
+
+	// 如果开启 Telegram 交互，就启动一个 goroutine 并行监听用户命令。
+	// goroutine 可以理解成 Go 里的轻量后台任务。
+	// 它和下面的调度循环同时运行，通过 state 共享最近状态。
+	stopTelegramControl := startTelegramControl(ctx, logger, opts, state)
+	defer stopTelegramControl()
+
 	// for { ... } 是无限循环。
 	// daemon 模式就是靠这个循环一直运行。
 	for {
 		// 每轮先立即跑一次计划，而不是等第一个 interval。
 		plan, err := buildPlan(ctx, opts, apply)
 		if err != nil {
+			state.recordError(err)
 			logger.Error("plan failed", "error", err)
 		} else if err := report.WritePlan(output, plan, opts.Format); err != nil {
+			state.recordError(err)
 			logger.Error("write plan failed", "error", err)
 		} else {
+			state.recordPlan(plan)
 			logPlanSummary(logger, plan)
-			lastNotificationFingerprint = notifyPlanOnce(ctx, logger, opts, plan, lastNotificationFingerprint)
+			if state.notificationsMuted() {
+				logger.Info("telegram notification muted", "until", state.mutedUntilText())
+			} else {
+				lastNotificationFingerprint = notifyPlanOnce(ctx, logger, opts, plan, lastNotificationFingerprint)
+			}
 		}
 
 		// select 会等待多个 channel。
@@ -358,6 +379,21 @@ func newNotifier(opts options) (*notify.TelegramNotifier, error) {
 	})
 }
 
+// telegramChatIDInt 把配置里的 Telegram chat id 转成 int64。
+//
+// Telegram 私聊 chat id 通常是正数，群组/频道通常是负数。
+func telegramChatIDInt(opts options) (int64, error) {
+	value := opts.TelegramChatID
+	if value == "" {
+		return 0, fmt.Errorf("telegram chat id is empty")
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("telegram chat id must be an integer: %w", err)
+	}
+	return parsed, nil
+}
+
 // notifyPlan 发送一次计划通知。
 //
 // 通知失败只写日志，不影响调度器本身。
@@ -370,7 +406,15 @@ func notifyPlan(ctx context.Context, logger *slog.Logger, opts options, plan dom
 	if notifier == nil || len(plan.Decisions) == 0 {
 		return false
 	}
-	if err := notifier.NotifyPlan(ctx, plan); err != nil {
+
+	if opts.TelegramInteractive {
+		// 如果开启了 Telegram 交互，就在自动通知下面附上快捷按钮。
+		// 这样用户收到告警后可以直接点“状态”“最近计划”“静音 1h”。
+		err = notifier.SendTextWithKeyboard(ctx, notify.FormatPlanMessage(plan), mainKeyboard())
+	} else {
+		err = notifier.NotifyPlan(ctx, plan)
+	}
+	if err != nil {
 		logger.Error("telegram notification failed", "error", err)
 		return false
 	}

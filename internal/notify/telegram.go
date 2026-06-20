@@ -60,6 +60,67 @@ type TelegramNotifier struct {
 	http     *http.Client
 }
 
+// TelegramInlineButton 表示 Telegram 消息下面的一个按钮。
+//
+// 用户点按钮后，Telegram 会把 CallbackData 原样发回 bot。
+// 调度器用它区分用户点的是“状态”“最近计划”还是“手动 dry-run”。
+type TelegramInlineButton struct {
+	Text         string `json:"text"`
+	CallbackData string `json:"callback_data"`
+}
+
+// TelegramBotCommand 表示 Telegram 左下角命令菜单里的一项。
+//
+// SetCommands 会把这些命令注册到 Telegram，这样用户不用记命令名。
+type TelegramBotCommand struct {
+	Command     string `json:"command"`
+	Description string `json:"description"`
+}
+
+// TelegramUpdate 是 getUpdates 返回的一条用户交互事件。
+//
+// 现在只关心两种事件：
+//   - Message：用户直接发 /status 这样的文本命令。
+//   - CallbackQuery：用户点击消息里的按钮。
+type TelegramUpdate struct {
+	UpdateID      int                    `json:"update_id"`
+	Message       *TelegramMessage       `json:"message,omitempty"`
+	CallbackQuery *TelegramCallbackQuery `json:"callback_query,omitempty"`
+}
+
+// TelegramMessage 表示 Telegram 普通消息。
+type TelegramMessage struct {
+	MessageID int           `json:"message_id"`
+	From      *TelegramUser `json:"from,omitempty"`
+	Chat      TelegramChat  `json:"chat"`
+	Text      string        `json:"text,omitempty"`
+}
+
+// TelegramCallbackQuery 表示 Telegram 按钮点击事件。
+type TelegramCallbackQuery struct {
+	ID      string           `json:"id"`
+	From    TelegramUser     `json:"from"`
+	Message *TelegramMessage `json:"message,omitempty"`
+	Data    string           `json:"data,omitempty"`
+}
+
+// TelegramUser 表示发消息或点按钮的 Telegram 用户。
+type TelegramUser struct {
+	ID        int64  `json:"id"`
+	Username  string `json:"username,omitempty"`
+	FirstName string `json:"first_name,omitempty"`
+	LastName  string `json:"last_name,omitempty"`
+}
+
+// TelegramChat 表示 Telegram 会话。
+//
+// 私聊时 Chat.ID 通常等于用户 ID；群组和频道会是负数。
+type TelegramChat struct {
+	ID    int64  `json:"id"`
+	Type  string `json:"type,omitempty"`
+	Title string `json:"title,omitempty"`
+}
+
 // NewTelegramNotifier 根据配置创建 TelegramNotifier。
 //
 // 返回值有两种正常情况：
@@ -90,7 +151,8 @@ func NewTelegramNotifier(cfg TelegramConfig) (*TelegramNotifier, error) {
 
 	client := cfg.HTTPClient
 	if client == nil {
-		client = &http.Client{Timeout: 10 * time.Second}
+		// getUpdates 会使用长轮询，所以默认超时要比普通 sendMessage 长一点。
+		client = &http.Client{Timeout: 35 * time.Second}
 	}
 
 	return &TelegramNotifier{
@@ -109,11 +171,18 @@ func (n *TelegramNotifier) NotifyPlan(ctx context.Context, plan domain.Plan) err
 		return nil
 	}
 	text := FormatPlanMessage(plan)
-	return n.sendMessage(ctx, text)
+	return n.SendText(ctx, text)
 }
 
-// sendMessage 调用 Telegram Bot API 的 sendMessage。
-func (n *TelegramNotifier) sendMessage(ctx context.Context, text string) error {
+// SendText 发送一条普通 Telegram 文本消息。
+func (n *TelegramNotifier) SendText(ctx context.Context, text string) error {
+	return n.SendTextWithKeyboard(ctx, text, nil)
+}
+
+// SendTextWithKeyboard 发送文本消息，并可选带一组内联按钮。
+//
+// keyboard 是二维切片：外层是一行一行按钮，内层是同一行里的多个按钮。
+func (n *TelegramNotifier) SendTextWithKeyboard(ctx context.Context, text string, keyboard [][]TelegramInlineButton) error {
 	payload := telegramSendMessageRequest{
 		ChatID:                n.chatID,
 		Text:                  text,
@@ -122,13 +191,70 @@ func (n *TelegramNotifier) sendMessage(ctx context.Context, text string) error {
 	if n.threadID > 0 {
 		payload.MessageThreadID = n.threadID
 	}
+	if len(keyboard) > 0 {
+		payload.ReplyMarkup = &telegramInlineKeyboardMarkup{InlineKeyboard: keyboard}
+	}
 
+	return n.postTelegram(ctx, "sendMessage", payload, nil)
+}
+
+// GetUpdates 用 Telegram 长轮询读取用户命令和按钮点击。
+//
+// offset 表示“从哪个 update_id 之后开始读”，用于避免重复处理旧消息。
+// timeout 是 Telegram 服务端等待新消息的时间，不是整个程序的运行周期。
+func (n *TelegramNotifier) GetUpdates(ctx context.Context, offset int, timeout time.Duration) ([]TelegramUpdate, error) {
+	seconds := int(timeout.Seconds())
+	if seconds < 1 {
+		seconds = 1
+	}
+	payload := telegramGetUpdatesRequest{
+		Offset:         offset,
+		Timeout:        seconds,
+		AllowedUpdates: []string{"message", "callback_query"},
+	}
+
+	var parsed telegramUpdatesResponse
+	if err := n.postTelegram(ctx, "getUpdates", payload, &parsed); err != nil {
+		return nil, err
+	}
+	if !parsed.OK {
+		return nil, fmt.Errorf("telegram getUpdates returned not ok: %s", parsed.Description)
+	}
+	return parsed.Result, nil
+}
+
+// AnswerCallback 告诉 Telegram“按钮点击已处理”。
+//
+// 如果不调用它，用户点按钮后 Telegram 客户端可能一直显示加载状态。
+func (n *TelegramNotifier) AnswerCallback(ctx context.Context, callbackID, text string) error {
+	payload := telegramAnswerCallbackRequest{
+		CallbackQueryID: callbackID,
+		Text:            text,
+	}
+	return n.postTelegram(ctx, "answerCallbackQuery", payload, nil)
+}
+
+// SetCommands 注册 Telegram 命令菜单。
+//
+// 这不是调度器必须功能；失败时上层只记录日志，不影响调度。
+func (n *TelegramNotifier) SetCommands(ctx context.Context, commands []TelegramBotCommand) error {
+	if len(commands) == 0 {
+		return nil
+	}
+	payload := telegramSetCommandsRequest{Commands: commands}
+	return n.postTelegram(ctx, "setMyCommands", payload, nil)
+}
+
+// postTelegram 统一调用 Telegram Bot API。
+//
+// result 可以是 nil；如果不是 nil，就把 Telegram 响应 JSON 解析进去。
+func (n *TelegramNotifier) postTelegram(ctx context.Context, method string, payload any, result any) error {
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("encode telegram payload: %w", err)
 	}
 
-	url := "https://api.telegram.org/bot" + n.botToken + "/sendMessage"
+	url := "https://api.telegram.org/bot" + n.botToken + "/" + method
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
 	if err != nil {
 		return fmt.Errorf("build telegram request: %w", err)
@@ -149,7 +275,18 @@ func (n *TelegramNotifier) sendMessage(ctx context.Context, text string) error {
 	}
 
 	var parsed telegramResponse
-	_ = json.Unmarshal(body, &parsed)
+	if result != nil {
+		if err := json.Unmarshal(body, result); err != nil {
+			return fmt.Errorf("decode telegram response: %w", err)
+		}
+		if base, ok := result.(interface {
+			baseResponse() telegramResponse
+		}); ok {
+			parsed = base.baseResponse()
+		}
+	} else {
+		_ = json.Unmarshal(body, &parsed)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 || !parsed.OK {
 		message := parsed.Description
 		if message == "" {
@@ -248,14 +385,50 @@ func redactToken(text, token string) string {
 
 // telegramSendMessageRequest 是 Telegram sendMessage 的 JSON 请求体。
 type telegramSendMessageRequest struct {
-	ChatID                string `json:"chat_id"`
-	MessageThreadID       int    `json:"message_thread_id,omitempty"`
-	Text                  string `json:"text"`
-	DisableWebPagePreview bool   `json:"disable_web_page_preview"`
+	ChatID                string                        `json:"chat_id"`
+	MessageThreadID       int                           `json:"message_thread_id,omitempty"`
+	Text                  string                        `json:"text"`
+	DisableWebPagePreview bool                          `json:"disable_web_page_preview"`
+	ReplyMarkup           *telegramInlineKeyboardMarkup `json:"reply_markup,omitempty"`
 }
 
 // telegramResponse 是 Telegram Bot API 的通用响应结构。
 type telegramResponse struct {
 	OK          bool   `json:"ok"`
 	Description string `json:"description"`
+}
+
+// telegramInlineKeyboardMarkup 是 Telegram 内联按钮布局。
+type telegramInlineKeyboardMarkup struct {
+	InlineKeyboard [][]TelegramInlineButton `json:"inline_keyboard"`
+}
+
+// telegramGetUpdatesRequest 是 getUpdates 的请求体。
+type telegramGetUpdatesRequest struct {
+	Offset         int      `json:"offset,omitempty"`
+	Timeout        int      `json:"timeout,omitempty"`
+	AllowedUpdates []string `json:"allowed_updates,omitempty"`
+}
+
+// telegramUpdatesResponse 是 getUpdates 的响应体。
+type telegramUpdatesResponse struct {
+	OK          bool             `json:"ok"`
+	Description string           `json:"description"`
+	Result      []TelegramUpdate `json:"result"`
+}
+
+// baseResponse 让 postTelegram 能从具体响应里取出通用 OK/Description。
+func (r telegramUpdatesResponse) baseResponse() telegramResponse {
+	return telegramResponse{OK: r.OK, Description: r.Description}
+}
+
+// telegramAnswerCallbackRequest 是 answerCallbackQuery 的请求体。
+type telegramAnswerCallbackRequest struct {
+	CallbackQueryID string `json:"callback_query_id"`
+	Text            string `json:"text,omitempty"`
+}
+
+// telegramSetCommandsRequest 是 setMyCommands 的请求体。
+type telegramSetCommandsRequest struct {
+	Commands []TelegramBotCommand `json:"commands"`
 }

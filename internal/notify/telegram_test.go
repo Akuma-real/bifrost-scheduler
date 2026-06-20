@@ -113,6 +113,142 @@ func TestTelegramNotifierSkipsEmptyPlan(t *testing.T) {
 	}
 }
 
+// TestTelegramNotifierSendsKeyboard 验证可以发送带按钮的 Telegram 消息。
+func TestTelegramNotifierSendsKeyboard(t *testing.T) {
+	var captured telegramSendMessageRequest
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if !strings.Contains(r.URL.Path, "/sendMessage") {
+			t.Fatalf("path = %s, want sendMessage", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+			t.Fatalf("decode telegram payload: %v", err)
+		}
+		return jsonResponse(map[string]any{"ok": true}), nil
+	})}
+
+	notifier, err := NewTelegramNotifier(TelegramConfig{
+		BotToken:   "123456:ABC",
+		ChatID:     "1926854736",
+		HTTPClient: client,
+	})
+	if err != nil {
+		t.Fatalf("NewTelegramNotifier returned error: %v", err)
+	}
+
+	err = notifier.SendTextWithKeyboard(context.Background(), "hello", [][]TelegramInlineButton{
+		{{Text: "状态", CallbackData: "status"}},
+	})
+	if err != nil {
+		t.Fatalf("SendTextWithKeyboard returned error: %v", err)
+	}
+	if captured.ReplyMarkup == nil {
+		t.Fatalf("reply_markup is nil, want inline keyboard")
+	}
+	if captured.ReplyMarkup.InlineKeyboard[0][0].CallbackData != "status" {
+		t.Fatalf("callback_data = %q, want status", captured.ReplyMarkup.InlineKeyboard[0][0].CallbackData)
+	}
+}
+
+// TestTelegramNotifierGetUpdates 验证 getUpdates 可以解析普通消息和按钮点击。
+func TestTelegramNotifierGetUpdates(t *testing.T) {
+	var captured telegramGetUpdatesRequest
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if !strings.Contains(r.URL.Path, "/getUpdates") {
+			t.Fatalf("path = %s, want getUpdates", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+			t.Fatalf("decode getUpdates payload: %v", err)
+		}
+		return jsonResponse(map[string]any{
+			"ok": true,
+			"result": []map[string]any{
+				{
+					"update_id": float64(11),
+					"message": map[string]any{
+						"message_id": float64(22),
+						"chat":       map[string]any{"id": float64(1926854736), "type": "private"},
+						"text":       "/status",
+					},
+				},
+				{
+					"update_id": float64(12),
+					"callback_query": map[string]any{
+						"id":   "callback-1",
+						"from": map[string]any{"id": float64(1926854736)},
+						"message": map[string]any{
+							"message_id": float64(23),
+							"chat":       map[string]any{"id": float64(1926854736), "type": "private"},
+						},
+						"data": "last",
+					},
+				},
+			},
+		}), nil
+	})}
+
+	notifier, err := NewTelegramNotifier(TelegramConfig{
+		BotToken:   "123456:ABC",
+		ChatID:     "1926854736",
+		HTTPClient: client,
+	})
+	if err != nil {
+		t.Fatalf("NewTelegramNotifier returned error: %v", err)
+	}
+
+	updates, err := notifier.GetUpdates(context.Background(), 10, 2*time.Second)
+	if err != nil {
+		t.Fatalf("GetUpdates returned error: %v", err)
+	}
+	if captured.Offset != 10 {
+		t.Fatalf("offset = %d, want 10", captured.Offset)
+	}
+	if captured.Timeout != 2 {
+		t.Fatalf("timeout = %d, want 2", captured.Timeout)
+	}
+	if len(updates) != 2 {
+		t.Fatalf("updates len = %d, want 2", len(updates))
+	}
+	if updates[0].Message == nil || updates[0].Message.Text != "/status" {
+		t.Fatalf("first update = %+v, want /status message", updates[0])
+	}
+	if updates[1].CallbackQuery == nil || updates[1].CallbackQuery.Data != "last" {
+		t.Fatalf("second update = %+v, want last callback", updates[1])
+	}
+}
+
+// TestTelegramNotifierSetCommands 验证命令菜单会调用 setMyCommands。
+func TestTelegramNotifierSetCommands(t *testing.T) {
+	var captured telegramSetCommandsRequest
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if !strings.Contains(r.URL.Path, "/setMyCommands") {
+			t.Fatalf("path = %s, want setMyCommands", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+			t.Fatalf("decode setMyCommands payload: %v", err)
+		}
+		return jsonResponse(map[string]any{"ok": true}), nil
+	})}
+
+	notifier, err := NewTelegramNotifier(TelegramConfig{
+		BotToken:   "123456:ABC",
+		ChatID:     "1926854736",
+		HTTPClient: client,
+	})
+	if err != nil {
+		t.Fatalf("NewTelegramNotifier returned error: %v", err)
+	}
+
+	err = notifier.SetCommands(context.Background(), []TelegramBotCommand{
+		{Command: "status", Description: "查看状态"},
+	})
+	if err != nil {
+		t.Fatalf("SetCommands returned error: %v", err)
+	}
+	if len(captured.Commands) != 1 || captured.Commands[0].Command != "status" {
+		t.Fatalf("commands = %+v, want status command", captured.Commands)
+	}
+}
+
 // TestFingerprintIgnoresDecisionOrder 验证指纹不受决策顺序影响。
 func TestFingerprintIgnoresDecisionOrder(t *testing.T) {
 	first := samplePlan()
