@@ -75,7 +75,7 @@ func commonFlags(fs *flag.FlagSet) *options {
 	fs.StringVar(&opts.LogFile, "log-file", os.Getenv("BIFROST_SCHEDULER_LOG_FILE"), "rotating log file path; empty writes to stdout/stderr only")
 	fs.StringVar(&opts.LogMaxSize, "log-max-size", envDefault("BIFROST_SCHEDULER_LOG_MAX_SIZE", "10MB"), "maximum size of one log file before rotation")
 	fs.IntVar(&opts.LogMaxBackups, "log-max-backups", envInt("BIFROST_SCHEDULER_LOG_MAX_BACKUPS", 5), "number of rotated log files to keep")
-	fs.BoolVar(&opts.LogStdout, "log-stdout", envBool("BIFROST_SCHEDULER_LOG_STDOUT", true), "also write output to stdout/stderr when log-file is set")
+	fs.BoolVar(&opts.LogStdout, "log-stdout", envBool("BIFROST_SCHEDULER_LOG_STDOUT", true), "also write full plan output to stdout when log-file is set; status logs still go to stderr")
 	return opts
 }
 
@@ -96,6 +96,7 @@ func runPlan(ctx context.Context, logger *slog.Logger, opts options, apply bool)
 		logger.Error("write plan failed", "error", err)
 		return 1
 	}
+	logPlanSummary(logger, plan)
 	if hasCritical(plan) {
 		return 10
 	}
@@ -123,6 +124,8 @@ func runDaemon(ctx context.Context, logger *slog.Logger, opts options, interval 
 			logger.Error("plan failed", "error", err)
 		} else if err := scheduler.WritePlan(output, plan, opts.Format); err != nil {
 			logger.Error("write plan failed", "error", err)
+		} else {
+			logPlanSummary(logger, plan)
 		}
 
 		select {
@@ -152,13 +155,45 @@ func setupLogging(opts options) (*slog.Logger, io.Writer, func(), error) {
 	}
 
 	var output io.Writer = logFile
-	var loggerOutput io.Writer = logFile
+	var loggerOutput io.Writer = io.MultiWriter(os.Stderr, logFile)
 	if opts.LogStdout {
 		output = io.MultiWriter(os.Stdout, logFile)
-		loggerOutput = io.MultiWriter(os.Stderr, logFile)
 	}
 
 	return slog.New(slog.NewJSONHandler(loggerOutput, &slog.HandlerOptions{Level: slog.LevelInfo})), output, closeFn, nil
+}
+
+func logPlanSummary(logger *slog.Logger, plan scheduler.Plan) {
+	critical := 0
+	warning := 0
+	applied := 0
+	failed := 0
+	for _, decision := range plan.Decisions {
+		switch decision.Severity {
+		case "critical":
+			critical++
+		case "warning":
+			warning++
+		}
+		if decision.Apply == nil {
+			continue
+		}
+		if decision.Apply.Applied {
+			applied++
+		} else {
+			failed++
+		}
+	}
+	logger.Info(
+		"plan completed",
+		"mode", plan.Mode,
+		"apply_enabled", plan.ApplyEnabled,
+		"decisions", len(plan.Decisions),
+		"critical", critical,
+		"warning", warning,
+		"applied", applied,
+		"failed", failed,
+	)
 }
 
 func buildPlan(ctx context.Context, opts options, apply bool) (scheduler.Plan, error) {

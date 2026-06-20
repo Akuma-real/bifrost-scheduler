@@ -131,7 +131,7 @@ BIFROST_SCHEDULER_LOG_MAX_BACKUPS=5
 BIFROST_SCHEDULER_LOG_STDOUT=false
 ```
 
-这样调度报告写入 `./logs/scheduler.log`，单文件到 10MB 自动轮转，最多保留 5 个备份；Docker 自身日志由 compose 的 `max-size/max-file` 限制。
+这样完整调度报告写入 `./logs/scheduler.log`，单文件到 10MB 自动轮转，最多保留 5 个备份；`docker logs` 只保留每轮短摘要和错误，Docker 自身日志由 compose 的 `max-size/max-file` 限制。
 
 也可以用命令行覆盖 API 地址：
 
