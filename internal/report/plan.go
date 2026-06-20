@@ -74,8 +74,13 @@ func Markdown(p domain.Plan) string {
 			fmt.Fprintf(&b, "%d. %s\n", i+1, HumanSummary(d))
 			fmt.Fprintf(&b, "   - 范围：pool `%s` / VK `%s` / provider `%s`\n", d.PoolID, d.VirtualKey, d.Provider)
 			fmt.Fprintf(&b, "   - 权重：当前 `%.4f` -> 目标 `%.4f`\n", d.CurrentWeight, d.TargetWeight)
-			fmt.Fprintf(&b, "   - 最近窗口：请求 `%d`，成功 `%d`，失败 `%d`，错误率 `%s`，P95 `%s ms`\n",
+			fmt.Fprintf(&b, "   - 最近窗口：请求 `%d`，成功 `%d`，失败 `%d`，错误率 `%s`，总耗时 P95 `%s ms`\n",
 				d.Inputs.Total, d.Inputs.Success, d.Inputs.Errors, percent(d.Inputs.ErrorRate), formatFloat(d.Inputs.P95LatencyMS))
+			if d.Inputs.ProbeTotal > 0 {
+				fmt.Fprintf(&b, "   - 主动测速：请求 `%d`，成功 `%d`，失败 `%d`，错误率 `%s`，首字 P95 `%s ms`，总耗时 P95 `%s ms`\n",
+					d.Inputs.ProbeTotal, d.Inputs.ProbeSuccess, d.Inputs.ProbeErrors, percent(d.Inputs.ProbeErrorRate),
+					formatFloat(d.Inputs.P95TTFTMS), formatFloat(d.Inputs.P95ProbeLatencyMS))
+			}
 			if d.Inputs.WindowCount > 0 {
 				fmt.Fprintf(&b, "   - 防误判证据：连续坏窗口 `%d` / 总坏窗口 `%d`；连续慢窗口 `%d` / 总慢窗口 `%d`；统计子窗口 `%d`\n",
 					d.Inputs.ConsecutiveBadWindows, d.Inputs.BadWindows, d.Inputs.ConsecutiveSlowWindows, d.Inputs.SlowWindows, d.Inputs.WindowCount)
@@ -83,6 +88,9 @@ func Markdown(p domain.Plan) string {
 			// 有错误类型才展示，避免空列表占位置。
 			if len(d.Inputs.ErrorFamilies) > 0 {
 				fmt.Fprintf(&b, "   - 错误类型：`%s`\n", strings.Join(d.Inputs.ErrorFamilies, "`, `"))
+			}
+			if len(d.Inputs.ProbeErrorFamilies) > 0 {
+				fmt.Fprintf(&b, "   - 主动测速错误类型：`%s`\n", strings.Join(d.Inputs.ProbeErrorFamilies, "`, `"))
 			}
 			// ignored errors 是用户侧错误，不应该拿来惩罚 provider，但报告里要透明展示。
 			if d.Inputs.IgnoredErrors > 0 {
@@ -92,7 +100,7 @@ func Markdown(p domain.Plan) string {
 				}
 				fmt.Fprintf(&b, "\n")
 			}
-			fmt.Fprintf(&b, "   - 原因：%s\n", humanReason(d))
+			fmt.Fprintf(&b, "   - 原因：%s\n", HumanReason(d))
 			// Apply 不为 nil 表示已经尝试执行过，报告要写执行结果。
 			if d.Apply != nil {
 				fmt.Fprintf(&b, "   - 执行结果：%s\n", humanApply(*d.Apply))
@@ -126,12 +134,13 @@ func Markdown(p domain.Plan) string {
 	}
 
 	fmt.Fprintf(&b, "\n## 最近指标\n\n")
-	fmt.Fprintf(&b, "| Pool | Provider | 有效请求 | 成功 | 失败 | 忽略错误 | 错误率 | P95 ms | Timeout/Idle | 关键错误 | 连续坏窗口 | 连续慢窗口 |\n")
-	fmt.Fprintf(&b, "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n")
+	fmt.Fprintf(&b, "| Pool | Provider | 有效请求 | 成功 | 失败 | 忽略错误 | 错误率 | 总耗时 P95 ms | 探测成功 | 探测失败 | 首字 P95 ms | 探测总耗时 P95 ms | Timeout/Idle | 关键错误 | 连续坏窗口 | 连续慢窗口 |\n")
+	fmt.Fprintf(&b, "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n")
 	for _, metric := range p.Metrics {
-		fmt.Fprintf(&b, "| `%s` | `%s` | %d | %d | %d | %d | %s | %s | %d | %d | %d | %d |\n",
+		fmt.Fprintf(&b, "| `%s` | `%s` | %d | %d | %d | %d | %s | %s | %d | %d | %s | %s | %d | %d | %d | %d |\n",
 			metric.PoolID, metric.Provider, metric.Total, metric.Success, metric.Errors, metric.IgnoredErrors, percent(metric.ErrorRate),
-			formatFloat(metric.P95LatencyMS), metric.TimeoutOrStreamIdle, metric.CriticalErrors, metric.ConsecutiveBadWindows, metric.ConsecutiveSlowWindows)
+			formatFloat(metric.P95LatencyMS), metric.ProbeSuccess, metric.ProbeErrors, formatFloat(metric.P95TTFTMS), formatFloat(metric.P95ProbeLatencyMS),
+			metric.TimeoutOrStreamIdle, metric.CriticalErrors, metric.ConsecutiveBadWindows, metric.ConsecutiveSlowWindows)
 	}
 	// Builder.String() 把全部拼好的文本变成 string 返回。
 	return b.String()
@@ -163,11 +172,11 @@ func HumanSummary(d domain.Decision) string {
 	}
 }
 
-// humanReason 把内部英文原因转换成更适合报告阅读的中文原因。
+// HumanReason 把内部英文原因转换成更适合报告阅读的中文原因。
 //
 // 内部原因保留英文是为了代码和测试更稳定。
 // 报告输出给人看，所以这里做一层中文解释。
-func humanReason(d domain.Decision) string {
+func HumanReason(d domain.Decision) string {
 	switch d.Action {
 	case "set_weight_zero":
 		// strings.Contains 判断原因文本里是否包含某段关键词。
@@ -178,6 +187,15 @@ func humanReason(d domain.Decision) string {
 			return "Bifrost 里存在该 provider，但调度器配置里没有它。"
 		}
 	case "set_weight":
+		if strings.Contains(d.Reason, "active probe error rate") {
+			return "主动测速失败率超过阈值，先降到最小探测权重。"
+		}
+		if strings.Contains(d.Reason, "active probe ttft priority") {
+			return "主动测速显示首字速度有差异，按首字优先、成本其次重新分配目标权重。"
+		}
+		if strings.Contains(d.Reason, "probe p95 ttft") {
+			return "主动测速首字 P95 超过阈值，降低权重。"
+		}
 		if strings.Contains(d.Reason, "healthy") {
 			return "最近窗口成功率达标，恢复到配置里的目标权重。"
 		}

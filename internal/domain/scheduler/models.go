@@ -62,6 +62,21 @@ type ProviderMetric struct {
 	SuccessRate float64 `json:"success_rate"`
 	// P95LatencyMS 是成功请求延迟的 P95；nil 表示没有足够样本。
 	P95LatencyMS *float64 `json:"p95_latency_ms,omitempty"`
+	// ProbeTotal 是主动测速次数。
+	ProbeTotal int `json:"probe_total,omitempty"`
+	// ProbeSuccess 是主动测速成功次数。
+	ProbeSuccess int `json:"probe_success,omitempty"`
+	// ProbeErrors 是主动测速失败次数。
+	ProbeErrors int `json:"probe_errors,omitempty"`
+	// ProbeErrorRate 是主动测速失败率。
+	ProbeErrorRate float64 `json:"probe_error_rate,omitempty"`
+	// P95TTFTMS 是主动流式测速得到的首字 P95。
+	// 它不是 Bifrost 日志里的 latency，也不能用总耗时代替。
+	P95TTFTMS *float64 `json:"p95_ttft_ms,omitempty"`
+	// P95ProbeLatencyMS 是主动测速的完整响应 P95，用来辅助判断。
+	P95ProbeLatencyMS *float64 `json:"p95_probe_latency_ms,omitempty"`
+	// ProbeErrorFamilies 是主动测速失败类型。
+	ProbeErrorFamilies []string `json:"probe_error_families,omitempty"`
 	// TimeoutOrStreamIdle 是 timeout 或 stream idle 类型错误数量。
 	TimeoutOrStreamIdle int `json:"timeout_or_stream_idle"`
 	// CriticalErrors 是额度、凭证、无 token 等关键错误数量。
@@ -124,17 +139,42 @@ type DecisionInputs struct {
 	ErrorRate            float64  `json:"error_rate"`
 	SuccessRate          float64  `json:"success_rate"`
 	P95LatencyMS         *float64 `json:"p95_latency_ms,omitempty"`
+	ProbeTotal           int      `json:"probe_total,omitempty"`
+	ProbeSuccess         int      `json:"probe_success,omitempty"`
+	ProbeErrors          int      `json:"probe_errors,omitempty"`
+	ProbeErrorRate       float64  `json:"probe_error_rate,omitempty"`
+	P95TTFTMS            *float64 `json:"p95_ttft_ms,omitempty"`
+	P95ProbeLatencyMS    *float64 `json:"p95_probe_latency_ms,omitempty"`
 	TimeoutOrStreamIdle  int      `json:"timeout_or_stream_idle"`
 	CriticalErrors       int      `json:"critical_errors"`
 	IgnoredErrors        int      `json:"ignored_errors,omitempty"`
 	IgnoredErrorFamilies []string `json:"ignored_error_families,omitempty"`
 	ErrorFamilies        []string `json:"error_families,omitempty"`
+	ProbeErrorFamilies   []string `json:"probe_error_families,omitempty"`
 	// 下面这些字段解释防误判窗口证据。
 	BadWindows             int `json:"bad_windows,omitempty"`
 	ConsecutiveBadWindows  int `json:"consecutive_bad_windows,omitempty"`
 	SlowWindows            int `json:"slow_windows,omitempty"`
 	ConsecutiveSlowWindows int `json:"consecutive_slow_windows,omitempty"`
 	WindowCount            int `json:"window_count,omitempty"`
+}
+
+// ProbeMetric 表示一次主动测速聚合后的 provider 指标。
+//
+// 它和 Bifrost 日志指标分开，是为了不混淆：
+// 日志里的 latency 是完整请求耗时；主动测速的 TTFT 才是首字时间。
+type ProbeMetric struct {
+	PoolID            string   `json:"pool_id"`
+	VirtualKey        string   `json:"virtual_key"`
+	Provider          string   `json:"provider"`
+	Total             int      `json:"total"`
+	Success           int      `json:"success"`
+	Errors            int      `json:"errors"`
+	ErrorRate         float64  `json:"error_rate"`
+	P95TTFTMS         *float64 `json:"p95_ttft_ms,omitempty"`
+	P95LatencyMS      *float64 `json:"p95_latency_ms,omitempty"`
+	ErrorFamilies     []string `json:"error_families,omitempty"`
+	SampleDescription string   `json:"sample_description,omitempty"`
 }
 
 // WindowMetric 表示总统计窗口里的一个小时间桶。

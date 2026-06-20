@@ -153,6 +153,11 @@ func (s fakeStore) LoadMetrics(_ context.Context, _ []domain.PoolConfig, _, _ ti
 	return s.metrics, nil
 }
 
+// LoadProbeMetrics 返回测试预置的主动测速指标。
+func (s fakeStore) LoadProbeMetrics(_ context.Context, _ []domain.PoolConfig, _ domain.ProbeConfig) ([]domain.ProbeMetric, error) {
+	return nil, nil
+}
+
 // SetProviderWeight 模拟写权重，并记录调用次数。
 func (s *fakeStore) SetProviderWeight(_ context.Context, _ domain.PoolProviderState, _ float64) error {
 	s.weightCalls++

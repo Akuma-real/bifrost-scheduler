@@ -38,6 +38,7 @@ type Planner struct {
 type Store interface {
 	LoadProviderStates(ctx context.Context, pools []domain.PoolConfig) ([]domain.PoolProviderState, error)
 	LoadMetrics(ctx context.Context, pools []domain.PoolConfig, windowStart, windowEnd time.Time, windowDuration time.Duration) ([]domain.ProviderMetric, error)
+	LoadProbeMetrics(ctx context.Context, pools []domain.PoolConfig, probe domain.ProbeConfig) ([]domain.ProbeMetric, error)
 	SetProviderWeight(ctx context.Context, state domain.PoolProviderState, weight float64) error
 	SetProviderKeysEnabled(ctx context.Context, state domain.PoolProviderState, enabled bool) error
 }
@@ -87,6 +88,14 @@ func (p Planner) BuildPlan(ctx context.Context, apply bool) (domain.Plan, error)
 	metrics, err := p.store.LoadMetrics(ctx, p.cfg.Pools, windowStart, p.now, p.cfg.WindowDuration)
 	if err != nil {
 		return domain.Plan{}, err
+	}
+	// 主动测速默认关闭。开启后，它会发 provider/model 的流式请求，测真正首字时间。
+	if p.cfg.Probe.Enabled {
+		probeMetrics, err := p.store.LoadProbeMetrics(ctx, p.cfg.Pools, p.cfg.Probe)
+		if err != nil {
+			return domain.Plan{}, err
+		}
+		metrics = domain.MergeProbeMetrics(metrics, probeMetrics)
 	}
 	// 领域层给每个小窗口打“坏窗口/慢窗口”标记。
 	metrics = p.decider.AnnotateWindows(metrics)

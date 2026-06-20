@@ -81,3 +81,14 @@ func TestPlanMarkdownShowsHumanActionPreview(t *testing.T) {
 		}
 	}
 }
+
+// TestHumanReasonKeepsActiveProbeErrorSpecific 验证主动测速失败率不会被普通错误率文案覆盖。
+func TestHumanReasonKeepsActiveProbeErrorSpecific(t *testing.T) {
+	reason := HumanReason(domain.Decision{
+		Action: "set_weight",
+		Reason: "active probe error rate 100.00% exceeded 50.00%",
+	})
+	if !strings.Contains(reason, "主动测速失败率") {
+		t.Fatalf("reason = %q, want active-probe-specific text", reason)
+	}
+}

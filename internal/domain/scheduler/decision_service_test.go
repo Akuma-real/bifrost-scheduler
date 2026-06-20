@@ -403,6 +403,123 @@ func TestLatencyNeedsConsecutiveSlowWindowsBeforeWeightReduction(t *testing.T) {
 	}
 }
 
+// TestProbeTTFTPriorityAdjustsHealthyWeights 验证主动测速启用后，首字速度会优先影响健康目标权重。
+func TestProbeTTFTPriorityAdjustsHealthyWeights(t *testing.T) {
+	cfg, err := NormalizeConfig(Config{
+		Probe:           ProbeConfig{Enabled: true, Model: "gpt-5.5", Samples: 2},
+		MinimumAttempts: 1,
+		Pools: []PoolConfig{
+			{
+				ID:         "pool_a",
+				VirtualKey: "vk_a",
+				Providers: []ProviderConfig{
+					{Name: "fast_expensive", CostWeight: 0.5},
+					{Name: "slow_cheap", CostWeight: 1},
+				},
+				Rules: &PoolRules{
+					MinProbeSamples: 2,
+					TTFTPriority:    0.75,
+					MinWeightChange: 0.01,
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NormalizeConfig returned error: %v", err)
+	}
+
+	fastTTFT := 1000.0
+	slowTTFT := 4000.0
+	metrics := MergeProbeMetrics(
+		[]ProviderMetric{
+			{PoolID: "pool_a", Provider: "fast_expensive", Total: 10, Success: 10, SuccessRate: 1},
+			{PoolID: "pool_a", Provider: "slow_cheap", Total: 10, Success: 10, SuccessRate: 1},
+		},
+		[]ProbeMetric{
+			{PoolID: "pool_a", Provider: "fast_expensive", Total: 2, Success: 2, P95TTFTMS: &fastTTFT},
+			{PoolID: "pool_a", Provider: "slow_cheap", Total: 2, Success: 2, P95TTFTMS: &slowTTFT},
+		},
+	)
+	decisions := NewDecisionService(cfg).Decide(
+		[]PoolProviderState{
+			{PoolID: "pool_a", VirtualKey: "vk_a", Provider: "fast_expensive", CurrentWeight: 0.5, CurrentInBifrost: true},
+			{PoolID: "pool_a", VirtualKey: "vk_a", Provider: "slow_cheap", CurrentWeight: 1, CurrentInBifrost: true},
+		},
+		metrics,
+		false,
+	)
+	foundSlow := false
+	for _, decision := range decisions {
+		if decision.Provider == "slow_cheap" {
+			foundSlow = true
+			if decision.Action != "set_weight" || decision.TargetWeight >= 1 {
+				t.Fatalf("slow decision = %+v, want lower weight", decision)
+			}
+			if decision.Inputs.P95TTFTMS == nil || *decision.Inputs.P95TTFTMS != slowTTFT {
+				t.Fatalf("slow decision inputs = %+v, want ttft evidence", decision.Inputs)
+			}
+		}
+	}
+	if !foundSlow {
+		t.Fatalf("decisions = %+v, want slow provider adjusted", decisions)
+	}
+}
+
+// TestProbeTTFTWorksWhenTrafficSamplesAreLow 验证业务流量低时，主动测速仍然可以提供首字调权证据。
+func TestProbeTTFTWorksWhenTrafficSamplesAreLow(t *testing.T) {
+	cfg, err := NormalizeConfig(Config{
+		Probe:           ProbeConfig{Enabled: true, Model: "gpt-5.5", Samples: 2},
+		MinimumAttempts: 10,
+		Pools: []PoolConfig{
+			{
+				ID:         "pool_a",
+				VirtualKey: "vk_a",
+				Providers: []ProviderConfig{
+					{Name: "fast_provider", CostWeight: 1},
+					{Name: "slow_provider", CostWeight: 1},
+				},
+				Rules: &PoolRules{MinProbeSamples: 2, TTFTPriority: 0.75, MinWeightChange: 0.01},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NormalizeConfig returned error: %v", err)
+	}
+
+	fastTTFT := 1000.0
+	slowTTFT := 3000.0
+	metrics := MergeProbeMetrics(
+		[]ProviderMetric{
+			{PoolID: "pool_a", Provider: "fast_provider"},
+			{PoolID: "pool_a", Provider: "slow_provider"},
+		},
+		[]ProbeMetric{
+			{PoolID: "pool_a", Provider: "fast_provider", Total: 2, Success: 2, P95TTFTMS: &fastTTFT},
+			{PoolID: "pool_a", Provider: "slow_provider", Total: 2, Success: 2, P95TTFTMS: &slowTTFT},
+		},
+	)
+	decisions := NewDecisionService(cfg).Decide(
+		[]PoolProviderState{
+			{PoolID: "pool_a", VirtualKey: "vk_a", Provider: "fast_provider", CurrentWeight: 1, CurrentInBifrost: true},
+			{PoolID: "pool_a", VirtualKey: "vk_a", Provider: "slow_provider", CurrentWeight: 1, CurrentInBifrost: true},
+		},
+		metrics,
+		false,
+	)
+	foundSlow := false
+	for _, decision := range decisions {
+		if decision.Provider == "slow_provider" {
+			foundSlow = true
+			if decision.Action != "set_weight" || decision.TargetWeight >= 1 {
+				t.Fatalf("slow decision = %+v, want lower weight from probe evidence", decision)
+			}
+		}
+	}
+	if !foundSlow {
+		t.Fatalf("decisions = %+v, want slow provider adjusted even with low traffic", decisions)
+	}
+}
+
 // TestAnnotateBadAndSlowWindows 验证 AnnotateWindows 能正确标记连续坏窗口和慢窗口。
 func TestAnnotateBadAndSlowWindows(t *testing.T) {
 	cfg, err := NormalizeConfig(Config{

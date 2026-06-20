@@ -3,6 +3,12 @@
   "api": {
     "base_url": "https://example-bifrost.internal"
   },
+  "probe": {
+    "enabled": false,
+    "model": "gpt-5.5",
+    "samples": 2,
+    "timeout": "20s"
+  },
   "pools": [
     {
       "id": "text_low",

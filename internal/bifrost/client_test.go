@@ -302,6 +302,72 @@ func TestSetProviderWeightPreservesOtherProviderConfigs(t *testing.T) {
 	}
 }
 
+// TestLoadProbeMetricsUsesProviderModelAndMeasuresTTFT 验证主动测速会用 provider/model 定向请求。
+func TestLoadProbeMetricsUsesProviderModelAndMeasuresTTFT(t *testing.T) {
+	client, err := NewBifrostClient(ClientOptions{
+		BaseURL:  "http://bifrost.local",
+		Username: "admin",
+		Password: "password",
+	})
+	if err != nil {
+		t.Fatalf("NewBifrostClient returned error: %v", err)
+	}
+	seenModels := map[string]bool{}
+	client.http = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/session/login":
+			return jsonResponse(t, map[string]any{"token": "session-token"}), nil
+		case r.Method == http.MethodGet && r.URL.Path == "/api/governance/virtual-keys":
+			return jsonResponse(t, map[string]any{"virtual_keys": []any{testVirtualKey()}}), nil
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions":
+			if got := r.Header.Get("x-bf-vk"); got != "vk-secret" {
+				t.Fatalf("x-bf-vk = %q, want vk-secret", got)
+			}
+			var payload chatCompletionRequest
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode probe payload: %v", err)
+			}
+			if !payload.Stream {
+				t.Fatalf("probe payload = %+v", payload)
+			}
+			if payload.MaxTokens != 1 {
+				t.Fatalf("probe max_tokens = %d, want 1", payload.MaxTokens)
+			}
+			seenModels[payload.Model] = true
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"O\"}}]}\n\ndata: [DONE]\n\n")),
+				Request:    r,
+			}, nil
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+		return nil, nil
+	})}
+	if err := client.Login(context.Background()); err != nil {
+		t.Fatalf("Login returned error: %v", err)
+	}
+
+	metrics, err := client.LoadProbeMetrics(context.Background(), []domain.PoolConfig{testPool()}, domain.ProbeConfig{
+		Enabled:         true,
+		Model:           "gpt-5.5",
+		Prompt:          "ping",
+		Samples:         1,
+		TimeoutDuration: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("LoadProbeMetrics returned error: %v", err)
+	}
+	metricA := probeMetricFor(metrics, "provider_a")
+	if metricA.Total != 1 || metricA.Success != 1 || metricA.P95TTFTMS == nil {
+		t.Fatalf("provider_a probe metric = %+v", metricA)
+	}
+	if !seenModels["provider_a/gpt-5.5"] || !seenModels["provider_b/gpt-5.5"] {
+		t.Fatalf("seen probe models = %+v, want both providers", seenModels)
+	}
+}
+
 // testPool 返回测试用的 pool 配置。
 func testPool() domain.PoolConfig {
 	return domain.PoolConfig{
@@ -321,6 +387,7 @@ func testVirtualKey() map[string]any {
 	return map[string]any{
 		"id":        "vk-1",
 		"name":      "vk_low_text",
+		"value":     "vk-secret",
 		"is_active": true,
 		"provider_configs": []any{
 			map[string]any{
@@ -349,6 +416,16 @@ func testVirtualKey() map[string]any {
 			},
 		},
 	}
+}
+
+// probeMetricFor 从主动测速指标里找某个 provider。
+func probeMetricFor(metrics []domain.ProbeMetric, provider string) domain.ProbeMetric {
+	for _, metric := range metrics {
+		if metric.Provider == provider {
+			return metric
+		}
+	}
+	return domain.ProbeMetric{}
 }
 
 // roundTripFunc 是一个函数类型。

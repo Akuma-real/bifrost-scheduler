@@ -122,6 +122,9 @@ func (s DecisionService) Decide(states []PoolProviderState, metrics []ProviderMe
 	for _, metric := range metrics {
 		metricsByPoolProvider[key(metric.PoolID, metric.Provider)] = metric
 	}
+	// 主动测速启用时，提前按 pool 计算每个 provider 的首字优先目标权重。
+	// 这样 DecideProvider 仍然只处理单个 provider 的最终判断。
+	probeTargets := s.probeAwareTargetWeights(metricsByPoolProvider)
 
 	// var decisions []Decision 声明一个 Decision 切片。
 	// 初始值是 nil，但可以直接 append。
@@ -139,9 +142,10 @@ func (s DecisionService) Decide(states []PoolProviderState, metrics []ProviderMe
 			// 如果不存在，Go 会返回结构体零值。
 			state := statesByPoolProvider[key(pool.ID, providerCfg.Name)]
 			metric := metricsByPoolProvider[key(pool.ID, providerCfg.Name)]
+			probeTarget, hasProbeTarget := probeTargets[key(pool.ID, providerCfg.Name)]
 
 			// 单个 provider 的判断交给 DecideProvider。
-			decision := s.DecideProvider(pool, providerCfg, state, metric, projectedActive)
+			decision := s.decideProvider(pool, providerCfg, state, metric, projectedActive, probeTarget, hasProbeTarget)
 			decision.DryRun = !applyEnabled
 			// 没有实际动作的决策不放进报告，避免报告噪音太大。
 			if DecisionNoop(decision) {
@@ -207,6 +211,45 @@ func (s DecisionService) Decide(states []PoolProviderState, metrics []ProviderMe
 	return decisions
 }
 
+// MergeProbeMetrics 把主动测速结果合并进 Bifrost 日志指标。
+//
+// 为什么单独做这个函数：
+// Bifrost 日志没有真实首字字段，主动测速是另一类数据源。
+// 合并时只写 Probe*/P95TTFTMS 字段，避免把总耗时误当首字。
+func MergeProbeMetrics(metrics []ProviderMetric, probes []ProbeMetric) []ProviderMetric {
+	if len(probes) == 0 {
+		return metrics
+	}
+	probesByPoolProvider := map[string]ProbeMetric{}
+	for _, probe := range probes {
+		probesByPoolProvider[key(probe.PoolID, probe.Provider)] = probe
+	}
+	out := make([]ProviderMetric, 0, len(metrics))
+	for _, metric := range metrics {
+		if probe, ok := probesByPoolProvider[key(metric.PoolID, metric.Provider)]; ok {
+			metric.ProbeTotal = probe.Total
+			metric.ProbeSuccess = probe.Success
+			metric.ProbeErrors = probe.Errors
+			metric.ProbeErrorRate = probe.ErrorRate
+			metric.P95TTFTMS = probe.P95TTFTMS
+			metric.P95ProbeLatencyMS = probe.P95LatencyMS
+			metric.ProbeErrorFamilies = cloneStringSlice(probe.ErrorFamilies)
+		}
+		out = append(out, metric)
+	}
+	return out
+}
+
+// cloneStringSlice 复制字符串切片。
+//
+// 领域层自己保留这个小工具，避免为了复制切片去依赖 Bifrost HTTP 适配层。
+func cloneStringSlice(values []string) []string {
+	if values == nil {
+		return nil
+	}
+	return append([]string(nil), values...)
+}
+
 // DecideProvider 是单个 provider 的核心健康判断规则。
 //
 // 这个函数是“纯判断”：只读取输入，返回一个 Decision。
@@ -220,6 +263,14 @@ func (s DecisionService) Decide(states []PoolProviderState, metrics []ProviderMe
 //  5. 错误、超时、延迟告警：降低权重。
 //  6. 恢复健康：恢复到配置里的 cost_weight。
 func (s DecisionService) DecideProvider(pool PoolConfig, provider ProviderConfig, state PoolProviderState, metric ProviderMetric, activeNow int) Decision {
+	return s.decideProvider(pool, provider, state, metric, activeNow, 0, false)
+}
+
+// decideProvider 是单个 provider 的核心实现。
+//
+// probeTarget/hasProbeTarget 来自主动测速的池内相对计算。
+// 公共方法 DecideProvider 保留原签名，方便测试单个规则。
+func (s DecisionService) decideProvider(pool PoolConfig, provider ProviderConfig, state PoolProviderState, metric ProviderMetric, activeNow int, probeTarget float64, hasProbeTarget bool) Decision {
 	// 取出这个 pool 的最终规则。
 	rules := pool.EffectiveRules()
 
@@ -285,6 +336,11 @@ func (s DecisionService) DecideProvider(pool PoolConfig, provider ProviderConfig
 			base.Severity = "warning"
 			base.Reason = "provider already has zero weight, but critical errors remain; retry disabling bound keys"
 			return base
+		}
+		// 主动测速是调度器自己发出的流式请求。
+		// 即使真实业务日志少，只要主动测速样本足够，也可以先按首字证据做温和调权。
+		if decision, ok := s.probeDecision(base, rules, metric, currentWeight, targetWeight, minWeight, probeTarget, hasProbeTarget); ok {
+			return decision
 		}
 		// 如果没有流量且权重为 0，给它一点点探测权重，让系统能重新收集证据。
 		if currentWeight == 0 && targetWeight > 0 {
@@ -385,6 +441,11 @@ func (s DecisionService) DecideProvider(pool PoolConfig, provider ProviderConfig
 		return base
 	}
 
+	// 真实业务错误已经排除后，再用主动测速做首字优先和成本调权。
+	if decision, ok := s.probeDecision(base, rules, metric, currentWeight, targetWeight, minWeight, probeTarget, hasProbeTarget); ok {
+		return decision
+	}
+
 	// 当前权重为 0，但最近成功率已经达标，就用最小权重重新放一点流量。
 	if currentWeight == 0 && metric.SuccessRate >= rules.MinSuccessRateForRecovery {
 		base.Action = "set_weight"
@@ -404,6 +465,125 @@ func (s DecisionService) DecideProvider(pool PoolConfig, provider ProviderConfig
 	}
 
 	return base
+}
+
+// probeDecision 根据主动测速证据生成温和调权决策。
+//
+// 注意它只处理主动测速，不处理 Bifrost 日志错误。
+// Bifrost 日志错误率、关键错误和连续坏窗口仍然是更强的安全兜底。
+func (s DecisionService) probeDecision(base Decision, rules PoolRules, metric ProviderMetric, currentWeight, targetWeight, minWeight, probeTarget float64, hasProbeTarget bool) (Decision, bool) {
+	if !s.cfg.Probe.Enabled {
+		return Decision{}, false
+	}
+	// 主动测速失败率高，先降到最小探测权重。
+	if metric.ProbeTotal >= rules.MinProbeSamples &&
+		metric.ProbeErrors > 0 &&
+		metric.ProbeErrorRate >= rules.MaxErrorRate {
+		if currentWeight == 0 {
+			return Decision{}, false
+		}
+		base.Action = "set_weight"
+		base.TargetWeight = minWeight
+		base.Severity = "warning"
+		base.Reason = fmt.Sprintf("active probe error rate %.2f%% exceeded %.2f%%", metric.ProbeErrorRate*100, rules.MaxErrorRate*100)
+		return base, true
+	}
+	// 首字优先：如果主动测速有足够样本，就按“首字速度 + 成本”计算目标权重。
+	// 这不是用 Bifrost 日志 latency 冒充首字，而是用流式探测真正收到第一段响应的时间。
+	if metric.P95TTFTMS == nil || metric.ProbeSuccess < rules.MinProbeSamples {
+		return Decision{}, false
+	}
+	if rules.MaxP95TTFTMS > 0 && *metric.P95TTFTMS > rules.MaxP95TTFTMS {
+		if currentWeight == 0 {
+			return Decision{}, false
+		}
+		base.Action = "set_weight"
+		base.TargetWeight = ClampWeight(targetWeight*0.5, minWeight, targetWeight)
+		base.Severity = "warning"
+		base.Reason = fmt.Sprintf("probe p95 ttft %.0fms exceeded %.0fms", *metric.P95TTFTMS, rules.MaxP95TTFTMS)
+		return base, true
+	}
+	// 权重为 0 的 provider 即使主动测速恢复，也先用最小权重重新进池。
+	// 不用 1-2 次主动测速直接拉到完整目标权重。
+	if currentWeight == 0 && targetWeight > 0 {
+		base.Action = "set_weight"
+		base.TargetWeight = minWeight
+		base.Severity = "info"
+		base.Reason = "active probe looks recovered; re-enter at minimum weight"
+		return base, true
+	}
+	if hasProbeTarget && math.Abs(currentWeight-probeTarget) >= rules.MinWeightChange {
+		base.Action = "set_weight"
+		base.TargetWeight = probeTarget
+		base.Severity = "info"
+		base.Reason = "active probe ttft priority adjusted weight"
+		return base, true
+	}
+	return Decision{}, false
+}
+
+// probeAwareTargetWeights 按“首字优先，其次成本”计算每个 provider 的健康目标权重。
+//
+// 公式分两步：
+//  1. 把 provider 的 TTFT 转成速度分。最快 provider 得 1，越慢越低。
+//  2. 用 TTFTPriority 混合速度分和 cost_weight。
+func (s DecisionService) probeAwareTargetWeights(metrics map[string]ProviderMetric) map[string]float64 {
+	out := map[string]float64{}
+	if !s.cfg.Probe.Enabled {
+		return out
+	}
+	for _, pool := range s.cfg.Pools {
+		rules := pool.EffectiveRules()
+		fastestTTFT := 0.0
+		maxCostWeight := 0.0
+		eligible := map[string]ProviderMetric{}
+
+		for _, provider := range pool.Providers {
+			metric, ok := metrics[key(pool.ID, provider.Name)]
+			if !ok || metric.P95TTFTMS == nil || metric.ProbeSuccess < rules.MinProbeSamples {
+				continue
+			}
+			ttft := *metric.P95TTFTMS
+			if ttft <= 0 {
+				continue
+			}
+			eligible[provider.Name] = metric
+			if fastestTTFT == 0 || ttft < fastestTTFT {
+				fastestTTFT = ttft
+			}
+			costWeight := provider.CostWeight
+			if costWeight <= 0 {
+				costWeight = rules.DefaultCostWeight
+			}
+			if costWeight > maxCostWeight {
+				maxCostWeight = costWeight
+			}
+		}
+		if len(eligible) < 2 || fastestTTFT <= 0 || maxCostWeight <= 0 {
+			continue
+		}
+
+		priority := ClampWeight(rules.TTFTPriority, 0, 1)
+		for _, provider := range pool.Providers {
+			metric, ok := eligible[provider.Name]
+			if !ok {
+				continue
+			}
+			costWeight := provider.CostWeight
+			if costWeight <= 0 {
+				costWeight = rules.DefaultCostWeight
+			}
+			minWeight := provider.MinWeight
+			if minWeight == 0 {
+				minWeight = rules.MinWeight
+			}
+			speedScore := fastestTTFT / *metric.P95TTFTMS
+			costScore := costWeight / maxCostWeight
+			score := priority*speedScore + (1-priority)*costScore
+			out[key(pool.ID, provider.Name)] = ClampWeight(costWeight*score, minWeight, costWeight)
+		}
+	}
+	return out
 }
 
 // pool 根据 poolID 查找 pool 配置。
@@ -532,11 +712,18 @@ func DecisionInputsFromMetric(metric ProviderMetric) DecisionInputs {
 		ErrorRate:              metric.ErrorRate,
 		SuccessRate:            metric.SuccessRate,
 		P95LatencyMS:           metric.P95LatencyMS,
+		ProbeTotal:             metric.ProbeTotal,
+		ProbeSuccess:           metric.ProbeSuccess,
+		ProbeErrors:            metric.ProbeErrors,
+		ProbeErrorRate:         metric.ProbeErrorRate,
+		P95TTFTMS:              metric.P95TTFTMS,
+		P95ProbeLatencyMS:      metric.P95ProbeLatencyMS,
 		TimeoutOrStreamIdle:    metric.TimeoutOrStreamIdle,
 		CriticalErrors:         metric.CriticalErrors,
 		IgnoredErrors:          metric.IgnoredErrors,
 		IgnoredErrorFamilies:   metric.IgnoredErrorFamilies,
 		ErrorFamilies:          metric.ErrorFamilies,
+		ProbeErrorFamilies:     metric.ProbeErrorFamilies,
 		BadWindows:             metric.BadWindows,
 		ConsecutiveBadWindows:  metric.ConsecutiveBadWindows,
 		SlowWindows:            metric.SlowWindows,

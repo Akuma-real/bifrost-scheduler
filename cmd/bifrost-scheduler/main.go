@@ -410,7 +410,7 @@ func notifyPlan(ctx context.Context, logger *slog.Logger, opts options, plan dom
 	if opts.TelegramInteractive {
 		// 如果开启了 Telegram 交互，就在自动通知下面附上快捷按钮。
 		// 这样用户收到告警后可以直接点“状态”“最近计划”“静音 1h”。
-		err = notifier.SendHTMLWithKeyboard(ctx, notify.FormatPlanHTMLMessage(plan), mainKeyboard())
+		err = notifier.NotifyPlanWithKeyboard(ctx, plan, mainKeyboard())
 	} else {
 		err = notifier.NotifyPlan(ctx, plan)
 	}

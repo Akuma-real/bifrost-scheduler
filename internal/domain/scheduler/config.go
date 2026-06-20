@@ -54,7 +54,29 @@ type Config struct {
 	QualityWindows  int          `json:"quality_windows"`
 	MinimumAttempts int          `json:"minimum_attempts"`
 	Cooldown        string       `json:"cooldown"`
+	Probe           ProbeConfig  `json:"probe"`
 	Pools           []PoolConfig `json:"pools"`
+}
+
+// ProbeConfig 表示主动测速配置。
+//
+// Bifrost 当前日志没有真实首字字段，所以要想按首字调度，
+// 就需要调度器自己发很小的流式请求，记录“发出请求 -> 收到第一个 token”的时间。
+type ProbeConfig struct {
+	// Enabled 为 true 时才会发主动测速请求。
+	Enabled bool `json:"enabled"`
+	// Model 是默认测速模型，例如 gpt-5.5。
+	// 真正请求时会变成 provider/model，例如 zz1cc_openai_lv4/gpt-5.5。
+	Model string `json:"model"`
+	// Prompt 是测速用提示词，应该非常短，减少费用和 token 噪音。
+	Prompt string `json:"prompt"`
+	// Samples 是每个 provider 每轮测速次数。
+	Samples int `json:"samples"`
+	// Timeout 是单次测速最长等待时间，例如 20s。
+	Timeout string `json:"timeout"`
+	// TimeoutDuration 是 Timeout 解析后的 time.Duration。
+	// json:"-" 表示它不从 JSON 读取，也不输出到 JSON。
+	TimeoutDuration time.Duration `json:"-"`
 }
 
 // PoolConfig 表示一个受管池子。
@@ -90,6 +112,8 @@ type PoolRules struct {
 	MaxTimeoutOrIdle int `json:"max_timeout_or_idle"`
 	// MaxP95LatencyMS 是 P95 延迟阈值；0 表示不因为延迟降权。
 	MaxP95LatencyMS float64 `json:"max_p95_latency_ms"`
+	// MaxP95TTFTMS 是主动测速得到的首字 P95 阈值；0 表示不按绝对首字阈值降权。
+	MaxP95TTFTMS float64 `json:"max_p95_ttft_ms"`
 	// MinSuccessRateForRecovery 是恢复权重时要求的最低成功率。
 	MinSuccessRateForRecovery float64 `json:"min_success_rate_for_recovery"`
 	// MinErrors 是触发错误率判断前至少要有多少失败样本。
@@ -98,8 +122,15 @@ type PoolRules struct {
 	CriticalErrorThreshold int `json:"critical_error_threshold"`
 	// MinLatencySamples 是判断 P95 延迟前至少要有多少成功样本。
 	MinLatencySamples int `json:"min_latency_samples"`
+	// MinProbeSamples 是主动测速至少成功多少次，才允许用首字结果调权。
+	MinProbeSamples int `json:"min_probe_samples"`
 	// RequiredBadWindows 是防误判用的连续坏窗口数量。
 	RequiredBadWindows int `json:"required_bad_windows"`
+	// TTFTPriority 是首字速度在“首字 + 成本”综合目标权重里的占比。
+	// 0.75 表示首字速度占 75%，成本权重占 25%。
+	TTFTPriority float64 `json:"ttft_priority"`
+	// MinWeightChange 是最小权重变动幅度，小于它就不写回，避免权重频繁抖动。
+	MinWeightChange float64 `json:"min_weight_change"`
 	// DefaultCostWeight 是 provider 没写 cost_weight 时的默认目标权重。
 	DefaultCostWeight float64 `json:"default_cost_weight"`
 	// MinWeight 是探测权重默认值。
@@ -128,6 +159,9 @@ type ProviderConfig struct {
 	// MinWeight 是单个 provider 的探测权重覆盖值。
 	// 不写就是 0，Normalize/DecideProvider 会改用 pool rules 里的默认 MinWeight。
 	MinWeight float64 `json:"min_weight"`
+	// ProbeModel 是单个 provider 的测速模型覆盖值。
+	// 不写就用全局 probe.model。
+	ProbeModel string `json:"probe_model,omitempty"`
 }
 
 // RuntimeConfig 是程序真正运行时使用的配置。
@@ -171,6 +205,33 @@ func NormalizeConfig(cfg Config) (RuntimeConfig, error) {
 	// cooldown 预留给冷却控制；当前配置仍然解析它，方便以后扩展。
 	if cfg.Cooldown == "" {
 		cfg.Cooldown = "30m"
+	}
+	// 主动测速默认关闭。只有用户明确写 probe.enabled=true 才会发送额外请求。
+	if cfg.Probe.Enabled {
+		if cfg.Probe.Model == "" {
+			cfg.Probe.Model = "gpt-5.5"
+		}
+		if cfg.Probe.Prompt == "" {
+			cfg.Probe.Prompt = "ping"
+		}
+		if cfg.Probe.Samples <= 0 {
+			cfg.Probe.Samples = 2
+		}
+		// 主动测速会真的调用上游，为了避免误配置导致费用失控，单轮样本数做硬上限。
+		if cfg.Probe.Samples > 5 {
+			return RuntimeConfig{}, fmt.Errorf("probe.samples cannot be greater than 5")
+		}
+		if cfg.Probe.Timeout == "" {
+			cfg.Probe.Timeout = "20s"
+		}
+		timeout, err := time.ParseDuration(cfg.Probe.Timeout)
+		if err != nil {
+			return RuntimeConfig{}, fmt.Errorf("parse probe.timeout: %w", err)
+		}
+		if timeout <= 0 {
+			return RuntimeConfig{}, fmt.Errorf("probe.timeout must be positive")
+		}
+		cfg.Probe.TimeoutDuration = timeout
 	}
 	// QualityWindows 表示看几个连续小窗口。
 	// 默认 3 个 15 分钟，就是总共看 45 分钟。
@@ -290,11 +351,15 @@ func DefaultPoolRules() PoolRules {
 		DisableErrorRate:          0.8,
 		MaxTimeoutOrIdle:          10,
 		MaxP95LatencyMS:           0,
+		MaxP95TTFTMS:              0,
 		MinSuccessRateForRecovery: 0.95,
 		MinErrors:                 3,
 		CriticalErrorThreshold:    2,
 		MinLatencySamples:         5,
+		MinProbeSamples:           2,
 		RequiredBadWindows:        2,
+		TTFTPriority:              0.75,
+		MinWeightChange:           0.02,
 		DefaultCostWeight:         1,
 		MinWeight:                 0.05,
 	}
@@ -325,8 +390,20 @@ func normalizePoolRules(rules *PoolRules) {
 	if rules.MinLatencySamples <= 0 {
 		rules.MinLatencySamples = defaults.MinLatencySamples
 	}
+	if rules.MinProbeSamples <= 0 {
+		rules.MinProbeSamples = defaults.MinProbeSamples
+	}
 	if rules.RequiredBadWindows <= 0 {
 		rules.RequiredBadWindows = defaults.RequiredBadWindows
+	}
+	if rules.TTFTPriority <= 0 {
+		rules.TTFTPriority = defaults.TTFTPriority
+	}
+	if rules.TTFTPriority > 1 {
+		rules.TTFTPriority = 1
+	}
+	if rules.MinWeightChange <= 0 {
+		rules.MinWeightChange = defaults.MinWeightChange
 	}
 	if rules.DefaultCostWeight <= 0 {
 		rules.DefaultCostWeight = defaults.DefaultCostWeight

@@ -176,11 +176,28 @@ func NewTelegramNotifier(cfg TelegramConfig) (*TelegramNotifier, error) {
 //
 // 如果 plan.Decisions 为空，函数直接返回 nil，不发送消息。
 func (n *TelegramNotifier) NotifyPlan(ctx context.Context, plan domain.Plan) error {
+	return n.NotifyPlanWithKeyboard(ctx, plan, nil)
+}
+
+// NotifyPlanWithKeyboard 把有变更的调度计划发送到 Telegram，并可选在最后一页带按钮。
+//
+// Telegram 单条消息最多约 4096 字符。
+// 调度计划动作多时，不能只发前几条；这里会按动作边界拆成多条消息。
+func (n *TelegramNotifier) NotifyPlanWithKeyboard(ctx context.Context, plan domain.Plan, keyboard [][]TelegramInlineButton) error {
 	if n == nil || len(plan.Decisions) == 0 {
 		return nil
 	}
-	text := FormatPlanHTMLMessage(plan)
-	return n.SendHTML(ctx, text)
+	parts := FormatPlanHTMLMessages(plan)
+	for i, text := range parts {
+		pageKeyboard := [][]TelegramInlineButton(nil)
+		if i == len(parts)-1 {
+			pageKeyboard = keyboard
+		}
+		if err := n.SendHTMLWithKeyboard(ctx, text, pageKeyboard); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // SendText 发送一条普通 Telegram 文本消息。
@@ -359,60 +376,140 @@ func FormatPlanMessage(plan domain.Plan) string {
 		fmt.Fprintf(&b, "\n%d. [%s] %s\n", i+1, decision.Severity, report.HumanSummary(decision))
 		fmt.Fprintf(&b, "   %s / %s\n", decision.PoolID, decision.Provider)
 		fmt.Fprintf(&b, "   权重：%.4f -> %.4f\n", decision.CurrentWeight, decision.TargetWeight)
+		if decision.Inputs.ProbeTotal > 0 {
+			fmt.Fprintf(&b, "   主动测速：%s\n", plainProbeText(decision.Inputs))
+		}
 		if decision.Apply != nil {
 			fmt.Fprintf(&b, "   执行：%s\n", applyText(*decision.Apply))
 		} else if decision.DryRun {
 			fmt.Fprintf(&b, "   执行：未执行，只预览\n")
 		}
 		if decision.Reason != "" {
-			fmt.Fprintf(&b, "   原因：%s\n", decision.Reason)
+			fmt.Fprintf(&b, "   原因：%s\n", report.HumanReason(decision))
 		}
 	}
 
 	return truncateTelegramText(b.String())
 }
 
-// FormatPlanHTMLMessage 把调度计划压缩成 Telegram HTML 富文本。
+// FormatPlanHTMLMessage 把调度计划压缩成一条 Telegram HTML 富文本。
+//
+// 如果计划太长，这个函数只返回第一页。
+// 自动通知要发完整内容时，应使用 FormatPlanHTMLMessages 或 NotifyPlan。
 //
 // 注意：运行时字符串必须用 html.EscapeString 转义。
 // 否则 provider 名或错误原因里如果有 < > &，Telegram 会把整条消息判为非法 HTML。
 func FormatPlanHTMLMessage(plan domain.Plan) string {
+	parts := FormatPlanHTMLMessages(plan)
+	if len(parts) == 0 {
+		return ""
+	}
+	return parts[0]
+}
+
+// FormatPlanHTMLMessages 把调度计划拆成一组 Telegram HTML 消息。
+//
+// 返回“多条消息”而不是“截断消息”，是为了保证动作列表完整显示。
+// 拆分只发生在动作之间，避免把 <code> 这类 HTML 标签截断。
+func FormatPlanHTMLMessages(plan domain.Plan) []string {
+	if len(plan.Decisions) == 0 {
+		return nil
+	}
+
+	blocks := make([]string, 0, len(plan.Decisions))
+	for i, decision := range plan.Decisions {
+		blocks = append(blocks, formatDecisionHTMLBlock(i+1, decision))
+	}
+
+	pageBlocks := splitTelegramHTMLBlocks(plan, blocks)
+	parts := make([]string, 0, len(pageBlocks))
+	for i, page := range pageBlocks {
+		var b strings.Builder
+		b.WriteString(formatPlanHTMLHeader(plan, i+1, len(pageBlocks)))
+		for _, block := range page {
+			b.WriteString(block)
+		}
+		parts = append(parts, truncateTelegramHTMLText(b.String()))
+	}
+	return parts
+}
+
+// formatPlanHTMLHeader 渲染每一页 Telegram 通知顶部的公共信息。
+func formatPlanHTMLHeader(plan domain.Plan, page, totalPages int) string {
 	var b strings.Builder
 	status := "不会写线上"
 	if plan.ApplyEnabled {
 		status = "会写线上"
 	}
 
-	fmt.Fprintf(&b, "<b>Bifrost 调度器发现 %d 个变更</b>\n", len(plan.Decisions))
+	title := fmt.Sprintf("Bifrost 调度器发现 %d 个变更", len(plan.Decisions))
+	if totalPages > 1 {
+		title = fmt.Sprintf("%s（第 %d/%d 页）", title, page, totalPages)
+	}
+	fmt.Fprintf(&b, "<b>%s</b>\n", escapeTelegramHTML(title))
 	fmt.Fprintf(&b, "模式：<code>%s</code>；执行：<b>%s</b>\n", escapeTelegramHTML(plan.Mode), escapeTelegramHTML(status))
 	fmt.Fprintf(&b, "时间：<code>%s</code>\n", escapeTelegramHTML(plan.GeneratedAt.Format(time.RFC3339)))
+	return b.String()
+}
 
-	for i, decision := range plan.Decisions {
-		if i >= 8 {
-			fmt.Fprintf(&b, "\n...还有 %d 个动作，完整内容见调度器日志。\n", len(plan.Decisions)-i)
-			break
-		}
-		fmt.Fprintf(&b, "\n%d. <b>[%s]</b> %s\n",
-			i+1,
-			escapeTelegramHTML(decision.Severity),
-			formatDecisionHTMLSummary(decision),
-		)
-		fmt.Fprintf(&b, "   <code>%s</code> / <code>%s</code>\n",
-			escapeTelegramHTML(decision.PoolID),
-			escapeTelegramHTML(decision.Provider),
-		)
-		fmt.Fprintf(&b, "   权重：<code>%.4f</code> -&gt; <code>%.4f</code>\n", decision.CurrentWeight, decision.TargetWeight)
-		if decision.Apply != nil {
-			fmt.Fprintf(&b, "   执行：%s\n", html.EscapeString(applyText(*decision.Apply)))
-		} else if decision.DryRun {
-			fmt.Fprintf(&b, "   执行：未执行，只预览\n")
-		}
-		if decision.Reason != "" {
-			fmt.Fprintf(&b, "   原因：%s\n", escapeTelegramHTMLShort(decision.Reason, 500))
-		}
+// formatDecisionHTMLBlock 渲染单个调度动作。
+//
+// 每个动作块自身的 HTML 标签都是完整闭合的，方便分页时整块移动。
+func formatDecisionHTMLBlock(index int, decision domain.Decision) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "\n%d. <b>[%s]</b> %s\n",
+		index,
+		escapeTelegramHTML(decision.Severity),
+		formatDecisionHTMLSummary(decision),
+	)
+	fmt.Fprintf(&b, "   <code>%s</code> / <code>%s</code>\n",
+		escapeTelegramHTML(decision.PoolID),
+		escapeTelegramHTML(decision.Provider),
+	)
+	fmt.Fprintf(&b, "   权重：<code>%.4f</code> -&gt; <code>%.4f</code>\n", decision.CurrentWeight, decision.TargetWeight)
+	if decision.Inputs.ProbeTotal > 0 {
+		fmt.Fprintf(&b, "   主动测速：%s\n", htmlProbeText(decision.Inputs))
+	}
+	if decision.Apply != nil {
+		fmt.Fprintf(&b, "   执行：%s\n", html.EscapeString(applyText(*decision.Apply)))
+	} else if decision.DryRun {
+		fmt.Fprintf(&b, "   执行：未执行，只预览\n")
+	}
+	if decision.Reason != "" {
+		fmt.Fprintf(&b, "   原因：%s\n", escapeTelegramHTMLShort(report.HumanReason(decision), 500))
+	}
+	return b.String()
+}
+
+// splitTelegramHTMLBlocks 按 Telegram 单条消息长度限制拆分动作块。
+func splitTelegramHTMLBlocks(plan domain.Plan, blocks []string) [][]string {
+	if len(blocks) == 0 {
+		return nil
 	}
 
-	return truncateTelegramHTMLText(b.String())
+	// Telegram 官方限制约 4096 字符。
+	// 这里留一点余量，避免中文、HTML 转义和后续文案调整时贴边失败。
+	const maxRunes = 3900
+	headerRunes := len([]rune(formatPlanHTMLHeader(plan, 99, 99)))
+
+	pages := make([][]string, 0, 1)
+	current := make([]string, 0)
+	currentRunes := headerRunes
+
+	for _, block := range blocks {
+		blockRunes := len([]rune(block))
+		if len(current) > 0 && currentRunes+blockRunes > maxRunes {
+			pages = append(pages, current)
+			current = make([]string, 0)
+			currentRunes = headerRunes
+		}
+		current = append(current, block)
+		currentRunes += blockRunes
+	}
+	if len(current) > 0 {
+		pages = append(pages, current)
+	}
+	return pages
 }
 
 // formatDecisionHTMLSummary 把动作摘要渲染成 Telegram HTML。
@@ -438,6 +535,38 @@ func formatDecisionHTMLSummary(d domain.Decision) string {
 	default:
 		return "对 " + provider + " 执行动作 <code>" + escapeTelegramHTML(d.Action) + "</code>"
 	}
+}
+
+// plainProbeText 把主动测速证据渲染成普通文本。
+func plainProbeText(inputs domain.DecisionInputs) string {
+	if inputs.P95TTFTMS != nil && inputs.ProbeSuccess > 0 {
+		return fmt.Sprintf("首字 P95 %.0f ms，成功 %d/%d", *inputs.P95TTFTMS, inputs.ProbeSuccess, inputs.ProbeTotal)
+	}
+	failed := inputs.ProbeErrors
+	if failed == 0 {
+		failed = inputs.ProbeTotal - inputs.ProbeSuccess
+	}
+	text := fmt.Sprintf("未拿到首字，成功 %d/%d，失败 %d", inputs.ProbeSuccess, inputs.ProbeTotal, failed)
+	if len(inputs.ProbeErrorFamilies) > 0 {
+		text += "，错误类型：" + strings.Join(inputs.ProbeErrorFamilies, ", ")
+	}
+	return text
+}
+
+// htmlProbeText 把主动测速证据渲染成 Telegram HTML。
+func htmlProbeText(inputs domain.DecisionInputs) string {
+	if inputs.P95TTFTMS != nil && inputs.ProbeSuccess > 0 {
+		return fmt.Sprintf("首字 P95 <code>%.0f ms</code>，成功 <code>%d/%d</code>", *inputs.P95TTFTMS, inputs.ProbeSuccess, inputs.ProbeTotal)
+	}
+	failed := inputs.ProbeErrors
+	if failed == 0 {
+		failed = inputs.ProbeTotal - inputs.ProbeSuccess
+	}
+	text := fmt.Sprintf("未拿到首字，成功 <code>%d/%d</code>，失败 <code>%d</code>", inputs.ProbeSuccess, inputs.ProbeTotal, failed)
+	if len(inputs.ProbeErrorFamilies) > 0 {
+		text += "，错误类型：<code>" + escapeTelegramHTML(strings.Join(inputs.ProbeErrorFamilies, ", ")) + "</code>"
+	}
+	return text
 }
 
 // escapeTelegramHTML 转义 Telegram HTML 里的运行时文本。

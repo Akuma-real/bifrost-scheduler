@@ -7,6 +7,7 @@ package notify
 // encoding/json：解析 Telegram 请求体。
 // io：构造假的 HTTP 响应体。
 // net/http：模拟 Telegram HTTP 请求。
+// strconv：把数字序号拼进测试 provider 名称。
 // strings：检查消息内容。
 // testing：Go 标准测试包。
 // time：构造固定时间。
@@ -16,6 +17,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -91,6 +93,106 @@ func TestTelegramNotifierSendsPlanDecision(t *testing.T) {
 	}
 }
 
+// TestTelegramNotifierSendsLongPlanInPages 验证动作很多时自动拆成多条 Telegram。
+//
+// 这个测试对应真实场景：10 个变更不能只显示前 8 个。
+func TestTelegramNotifierSendsLongPlanInPages(t *testing.T) {
+	var captured []telegramSendMessageRequest
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		var capturedRequest telegramSendMessageRequest
+		if err := json.NewDecoder(r.Body).Decode(&capturedRequest); err != nil {
+			t.Fatalf("decode telegram payload: %v", err)
+		}
+		captured = append(captured, capturedRequest)
+		return jsonResponse(map[string]any{"ok": true}), nil
+	})}
+
+	notifier, err := NewTelegramNotifier(TelegramConfig{
+		BotToken:   "123456:ABC",
+		ChatID:     "12345",
+		HTTPClient: client,
+	})
+	if err != nil {
+		t.Fatalf("NewTelegramNotifier returned error: %v", err)
+	}
+
+	plan := samplePlan()
+	plan.Decisions = make([]domain.Decision, 0, 14)
+	for i := 1; i <= 14; i++ {
+		plan.Decisions = append(plan.Decisions, sampleDecision(i))
+	}
+
+	if err := notifier.NotifyPlan(context.Background(), plan); err != nil {
+		t.Fatalf("NotifyPlan returned error: %v", err)
+	}
+	if len(captured) < 2 {
+		t.Fatalf("sent messages = %d, want multiple pages", len(captured))
+	}
+
+	combined := ""
+	for _, message := range captured {
+		if len([]rune(message.Text)) > 3900 {
+			t.Fatalf("message length = %d, want <= 3900", len([]rune(message.Text)))
+		}
+		if message.ParseMode != TelegramParseHTML {
+			t.Fatalf("parse_mode = %q, want HTML", message.ParseMode)
+		}
+		combined += message.Text
+	}
+	if !strings.Contains(combined, "provider_14") {
+		t.Fatalf("telegram pages = %q, want final provider included", combined)
+	}
+	if strings.Contains(combined, "还有") || strings.Contains(combined, "完整内容见调度器日志") {
+		t.Fatalf("telegram pages = %q, want full content without omitted-action text", combined)
+	}
+}
+
+// TestTelegramNotifierPutsKeyboardOnlyOnLastPage 验证分页通知只在最后一页带按钮。
+func TestTelegramNotifierPutsKeyboardOnlyOnLastPage(t *testing.T) {
+	var captured []telegramSendMessageRequest
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		var capturedRequest telegramSendMessageRequest
+		if err := json.NewDecoder(r.Body).Decode(&capturedRequest); err != nil {
+			t.Fatalf("decode telegram payload: %v", err)
+		}
+		captured = append(captured, capturedRequest)
+		return jsonResponse(map[string]any{"ok": true}), nil
+	})}
+
+	notifier, err := NewTelegramNotifier(TelegramConfig{
+		BotToken:   "123456:ABC",
+		ChatID:     "12345",
+		HTTPClient: client,
+	})
+	if err != nil {
+		t.Fatalf("NewTelegramNotifier returned error: %v", err)
+	}
+
+	plan := samplePlan()
+	plan.Decisions = make([]domain.Decision, 0, 14)
+	for i := 1; i <= 14; i++ {
+		plan.Decisions = append(plan.Decisions, sampleDecision(i))
+	}
+
+	err = notifier.NotifyPlanWithKeyboard(context.Background(), plan, [][]TelegramInlineButton{
+		{{Text: "状态", CallbackData: "status"}},
+	})
+	if err != nil {
+		t.Fatalf("NotifyPlanWithKeyboard returned error: %v", err)
+	}
+	if len(captured) < 2 {
+		t.Fatalf("sent messages = %d, want multiple pages", len(captured))
+	}
+	for i, message := range captured[:len(captured)-1] {
+		if message.ReplyMarkup != nil {
+			t.Fatalf("message %d has keyboard, want keyboard only on last page", i)
+		}
+	}
+	if captured[len(captured)-1].ReplyMarkup == nil {
+		t.Fatalf("last message has nil keyboard, want inline keyboard")
+	}
+}
+
 // TestTelegramNotifierSkipsEmptyPlan 验证没有决策时不发送通知。
 func TestTelegramNotifierSkipsEmptyPlan(t *testing.T) {
 	calls := 0
@@ -131,7 +233,7 @@ func TestTelegramNotifierSendsKeyboard(t *testing.T) {
 
 	notifier, err := NewTelegramNotifier(TelegramConfig{
 		BotToken:   "123456:ABC",
-		ChatID:     "1926854736",
+		ChatID:     "12345",
 		HTTPClient: client,
 	})
 	if err != nil {
@@ -164,7 +266,7 @@ func TestTelegramNotifierSendsHTMLWithKeyboard(t *testing.T) {
 
 	notifier, err := NewTelegramNotifier(TelegramConfig{
 		BotToken:   "123456:ABC",
-		ChatID:     "1926854736",
+		ChatID:     "12345",
 		HTTPClient: client,
 	})
 	if err != nil {
@@ -200,7 +302,7 @@ func TestTelegramNotifierSendChatAction(t *testing.T) {
 
 	notifier, err := NewTelegramNotifier(TelegramConfig{
 		BotToken:   "123456:ABC",
-		ChatID:     "1926854736",
+		ChatID:     "12345",
 		ThreadID:   "456",
 		HTTPClient: client,
 	})
@@ -211,8 +313,8 @@ func TestTelegramNotifierSendChatAction(t *testing.T) {
 	if err := notifier.SendChatAction(context.Background(), TelegramActionTyping); err != nil {
 		t.Fatalf("SendChatAction returned error: %v", err)
 	}
-	if captured.ChatID != "1926854736" {
-		t.Fatalf("chat_id = %q, want 1926854736", captured.ChatID)
+	if captured.ChatID != "12345" {
+		t.Fatalf("chat_id = %q, want 12345", captured.ChatID)
 	}
 	if captured.MessageThreadID != 456 {
 		t.Fatalf("thread id = %d, want 456", captured.MessageThreadID)
@@ -237,6 +339,42 @@ func TestFormatPlanHTMLMessageEscapesRuntimeText(t *testing.T) {
 	}
 }
 
+// TestFormatPlanHTMLMessageExplainsMissingProbeTTFT 验证测速失败时不显示无意义的 "- ms"。
+func TestFormatPlanHTMLMessageExplainsMissingProbeTTFT(t *testing.T) {
+	plan := samplePlan()
+	plan.Decisions[0].Inputs = domain.DecisionInputs{
+		ProbeTotal:         1,
+		ProbeSuccess:       0,
+		ProbeErrors:        1,
+		ProbeErrorFamilies: []string{"rate_or_concurrency_limit"},
+	}
+
+	text := FormatPlanHTMLMessage(plan)
+	if strings.Contains(text, "- ms") {
+		t.Fatalf("html text = %q, want no '- ms' for failed probe", text)
+	}
+	if !strings.Contains(text, "未拿到首字") {
+		t.Fatalf("html text = %q, want missing TTFT explanation", text)
+	}
+	if !strings.Contains(text, "rate_or_concurrency_limit") {
+		t.Fatalf("html text = %q, want probe error family", text)
+	}
+}
+
+// TestFormatPlanHTMLMessageUsesHumanReason 验证 Telegram 原因使用中文解释。
+func TestFormatPlanHTMLMessageUsesHumanReason(t *testing.T) {
+	plan := samplePlan()
+	plan.Decisions[0].Reason = "active probe ttft priority adjusted weight"
+
+	text := FormatPlanHTMLMessage(plan)
+	if strings.Contains(text, "active probe ttft priority adjusted weight") {
+		t.Fatalf("html text = %q, want translated reason instead of internal reason", text)
+	}
+	if !strings.Contains(text, "主动测速显示首字速度有差异") {
+		t.Fatalf("html text = %q, want Chinese human reason", text)
+	}
+}
+
 // TestTelegramNotifierGetUpdates 验证 getUpdates 可以解析普通消息和按钮点击。
 func TestTelegramNotifierGetUpdates(t *testing.T) {
 	var captured telegramGetUpdatesRequest
@@ -254,7 +392,7 @@ func TestTelegramNotifierGetUpdates(t *testing.T) {
 					"update_id": float64(11),
 					"message": map[string]any{
 						"message_id": float64(22),
-						"chat":       map[string]any{"id": float64(1926854736), "type": "private"},
+						"chat":       map[string]any{"id": float64(12345), "type": "private"},
 						"text":       "/status",
 					},
 				},
@@ -262,10 +400,10 @@ func TestTelegramNotifierGetUpdates(t *testing.T) {
 					"update_id": float64(12),
 					"callback_query": map[string]any{
 						"id":   "callback-1",
-						"from": map[string]any{"id": float64(1926854736)},
+						"from": map[string]any{"id": float64(12345)},
 						"message": map[string]any{
 							"message_id": float64(23),
-							"chat":       map[string]any{"id": float64(1926854736), "type": "private"},
+							"chat":       map[string]any{"id": float64(12345), "type": "private"},
 						},
 						"data": "last",
 					},
@@ -276,7 +414,7 @@ func TestTelegramNotifierGetUpdates(t *testing.T) {
 
 	notifier, err := NewTelegramNotifier(TelegramConfig{
 		BotToken:   "123456:ABC",
-		ChatID:     "1926854736",
+		ChatID:     "12345",
 		HTTPClient: client,
 	})
 	if err != nil {
@@ -319,7 +457,7 @@ func TestTelegramNotifierSetCommands(t *testing.T) {
 
 	notifier, err := NewTelegramNotifier(TelegramConfig{
 		BotToken:   "123456:ABC",
-		ChatID:     "1926854736",
+		ChatID:     "12345",
 		HTTPClient: client,
 	})
 	if err != nil {
@@ -376,6 +514,30 @@ func samplePlan() domain.Plan {
 			Reason:        "error rate exceeded threshold",
 			Apply:         &domain.ApplyResult{Applied: true, Message: "provider weight updated"},
 		}},
+	}
+}
+
+// sampleDecision 构造分页测试里的一条动作。
+func sampleDecision(index int) domain.Decision {
+	ttft := float64(1000 + index)
+	return domain.Decision{
+		PoolID:        "pool_a",
+		VirtualKey:    "vk_a",
+		Provider:      "provider_" + strconv.Itoa(index),
+		Action:        "set_weight",
+		CurrentWeight: 0.9,
+		TargetWeight:  0.05,
+		Severity:      "info",
+		DryRun:        true,
+		Reason: strings.Repeat(
+			"active probe ttft priority adjusted weight; ",
+			24,
+		),
+		Inputs: domain.DecisionInputs{
+			ProbeTotal:   3,
+			ProbeSuccess: 3,
+			P95TTFTMS:    &ttft,
+		},
 	}
 }
 

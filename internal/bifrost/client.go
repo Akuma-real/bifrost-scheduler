@@ -6,6 +6,7 @@ package bifrost
 
 // import 表示这个文件要使用哪些包。
 //
+// bufio：按行读取流式 SSE 响应。
 // bytes：把 JSON 字节变成 HTTP 请求体。
 // context：控制请求取消和超时。
 // encoding/json：编码请求 JSON、解析响应 JSON。
@@ -20,6 +21,7 @@ package bifrost
 // time：时间范围、请求超时、日志时间戳。
 // domain：调度器领域层的数据结构。
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -239,6 +241,42 @@ func (c *BifrostClient) LoadMetrics(ctx context.Context, pools []domain.PoolConf
 	return out, nil
 }
 
+// LoadProbeMetrics 主动发流式测试请求，测每个 provider 的首字时间。
+//
+// 它只读配置，不改权重，不改 key。
+// 请求模型使用 provider/model 形式，让 Bifrost 定向到指定 provider。
+func (c *BifrostClient) LoadProbeMetrics(ctx context.Context, pools []domain.PoolConfig, probe domain.ProbeConfig) ([]domain.ProbeMetric, error) {
+	if !probe.Enabled {
+		return nil, nil
+	}
+	virtualKeys, err := c.loadVirtualKeysForPools(ctx, pools)
+	if err != nil {
+		return nil, err
+	}
+
+	var out []domain.ProbeMetric
+	for _, pool := range pools {
+		vk, ok := virtualKeys[pool.VirtualKey]
+		if !ok || vk.Value == "" {
+			out = append(out, zeroProbeMetrics(pool)...)
+			continue
+		}
+		for _, provider := range pool.Providers {
+			// quarantine / allowed=false 不参与测速，避免主动打到你明确隔离的渠道。
+			if !provider.AllowedInPool() {
+				continue
+			}
+			model := provider.ProbeModel
+			if model == "" {
+				model = probe.Model
+			}
+			metric := c.probeProvider(ctx, pool, provider.Name, vk.Value, model, probe)
+			out = append(out, metric)
+		}
+	}
+	return out, nil
+}
+
 // SetProviderWeight 更新某个 provider config 的权重。
 //
 // Bifrost 的 VK 更新接口通常要求提交整个 Virtual Key 配置，
@@ -406,6 +444,96 @@ func (c *BifrostClient) loadLogs(ctx context.Context, virtualKeyID string, windo
 		}
 	}
 	return out, nil
+}
+
+// probeProvider 对单个 provider 做多次主动测速，并聚合成 ProbeMetric。
+func (c *BifrostClient) probeProvider(ctx context.Context, pool domain.PoolConfig, providerName, virtualKeyValue, model string, probe domain.ProbeConfig) domain.ProbeMetric {
+	acc := probeAccumulator{}
+	for i := 0; i < probe.Samples; i++ {
+		result := c.probeOnce(ctx, virtualKeyValue, providerName, model, probe)
+		acc.add(result)
+	}
+	return acc.metric(pool, providerName)
+}
+
+// probeOnce 执行一次流式测速。
+//
+// 返回值 probeSample 里：
+//   - TTFTMS 是发出请求到收到第一段 SSE data 的时间。
+//   - LatencyMS 是完整响应结束的时间。
+func (c *BifrostClient) probeOnce(ctx context.Context, virtualKeyValue, providerName, model string, probe domain.ProbeConfig) probeSample {
+	timeout := probe.TimeoutDuration
+	if timeout <= 0 {
+		timeout = 20 * time.Second
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	payload := chatCompletionRequest{
+		Model:     providerName + "/" + model,
+		Stream:    true,
+		MaxTokens: 1,
+		Messages: []chatMessage{
+			{Role: "user", Content: probe.Prompt},
+		},
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return probeSample{ErrorFamily: "client_request_error"}
+	}
+
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, c.resolve("/v1/chat/completions", nil), bytes.NewReader(data))
+	if err != nil {
+		return probeSample{ErrorFamily: "client_request_error"}
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-bf-vk", virtualKeyValue)
+
+	startedAt := time.Now()
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return probeSample{ErrorFamily: categorizeProbeError(err.Error())}
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := readLimited(resp.Body, 64<<10)
+		return probeSample{ErrorFamily: categorizeProbeError(string(body))}
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	// 默认 scanner token 上限 64K，对 SSE 可能偏小；这里放大到 1MiB。
+	scanner.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	firstDataSeen := false
+	var ttft time.Duration
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		dataLine := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if dataLine == "" {
+			continue
+		}
+		if !firstDataSeen {
+			firstDataSeen = true
+			ttft = time.Since(startedAt)
+		}
+		if dataLine == "[DONE]" {
+			break
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return probeSample{ErrorFamily: categorizeProbeError(err.Error())}
+	}
+	if !firstDataSeen {
+		return probeSample{ErrorFamily: "empty_stream"}
+	}
+	return probeSample{
+		TTFTMS:    durationMilliseconds(ttft),
+		LatencyMS: durationMilliseconds(time.Since(startedAt)),
+	}
 }
 
 // setProviderKeyEnabled 启用或禁用单个 provider key。
@@ -598,6 +726,8 @@ type virtualKey struct {
 	ID string `json:"id"`
 	// Name 是 VK 名称。
 	Name string `json:"name"`
+	// Value 是 VK 的真实调用凭证。主动测速要用它放到 x-bf-vk 请求头里。
+	Value string `json:"value,omitempty"`
 	// Description 是 VK 描述。
 	Description string `json:"description,omitempty"`
 	// IsActive 表示 VK 是否启用。
@@ -756,6 +886,20 @@ type logEntry struct {
 	VirtualKeyName string `json:"virtual_key_name"`
 }
 
+// chatCompletionRequest 是主动测速用的最小 Chat Completions 请求。
+type chatCompletionRequest struct {
+	Model     string        `json:"model"`
+	Stream    bool          `json:"stream"`
+	MaxTokens int           `json:"max_tokens"`
+	Messages  []chatMessage `json:"messages"`
+}
+
+// chatMessage 是 Chat Completions 里的单条消息。
+type chatMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
 // aggregateMetrics 把原始日志聚合成每个 provider 的指标。
 //
 // 输入是 Bifrost 日志，输出是领域层 ProviderMetric。
@@ -896,6 +1040,19 @@ func zeroMetrics(pool domain.PoolConfig) []domain.ProviderMetric {
 	return out
 }
 
+// zeroProbeMetrics 给找不到 VK 的 pool 生成零主动测速指标。
+func zeroProbeMetrics(pool domain.PoolConfig) []domain.ProbeMetric {
+	out := make([]domain.ProbeMetric, 0, len(pool.Providers))
+	for _, provider := range pool.Providers {
+		out = append(out, domain.ProbeMetric{
+			PoolID:     pool.ID,
+			VirtualKey: pool.VirtualKey,
+			Provider:   provider.Name,
+		})
+	}
+	return out
+}
+
 // metricAccumulator 是内部累计器。
 //
 // 它一条条接收 logEntry，最后再生成 ProviderMetric 或 WindowMetric。
@@ -910,6 +1067,64 @@ type metricAccumulator struct {
 	lastSeenAt          *time.Time
 	errorFamilies       map[string]bool
 	ignoredFamilies     map[string]bool
+}
+
+// probeSample 是单次主动测速结果。
+type probeSample struct {
+	TTFTMS      float64
+	LatencyMS   float64
+	ErrorFamily string
+}
+
+// probeAccumulator 聚合多次主动测速样本。
+type probeAccumulator struct {
+	total         int
+	success       int
+	errors        int
+	ttfts         []float64
+	latencies     []float64
+	errorFamilies map[string]bool
+}
+
+// add 把一次主动测速样本加入累计器。
+func (a *probeAccumulator) add(sample probeSample) {
+	a.total++
+	if sample.ErrorFamily != "" {
+		a.errors++
+		if a.errorFamilies == nil {
+			a.errorFamilies = map[string]bool{}
+		}
+		a.errorFamilies[sample.ErrorFamily] = true
+		return
+	}
+	a.success++
+	if sample.TTFTMS > 0 {
+		a.ttfts = append(a.ttfts, sample.TTFTMS)
+	}
+	if sample.LatencyMS > 0 {
+		a.latencies = append(a.latencies, sample.LatencyMS)
+	}
+}
+
+// metric 把累计器转换成领域层 ProbeMetric。
+func (a *probeAccumulator) metric(pool domain.PoolConfig, provider string) domain.ProbeMetric {
+	errorRate := 0.0
+	if a.total > 0 {
+		errorRate = float64(a.errors) / float64(a.total)
+	}
+	return domain.ProbeMetric{
+		PoolID:            pool.ID,
+		VirtualKey:        pool.VirtualKey,
+		Provider:          provider,
+		Total:             a.total,
+		Success:           a.success,
+		Errors:            a.errors,
+		ErrorRate:         errorRate,
+		P95TTFTMS:         percentile(a.ttfts, 0.95),
+		P95LatencyMS:      percentile(a.latencies, 0.95),
+		ErrorFamilies:     sortedFamilies(a.errorFamilies),
+		SampleDescription: "active streaming probe",
+	}
 }
 
 // add 把一条日志计入累计器。
@@ -1061,6 +1276,18 @@ func categorizeError(raw json.RawMessage) string {
 	}
 }
 
+// categorizeProbeError 把主动测速失败归类。
+//
+// 主动测速失败来自 HTTP 状态、网络错误或 SSE 读取错误，
+// 没有 Bifrost 日志里的 error_details，所以这里把文本包装成 JSON 字符串后复用 categorizeError。
+func categorizeProbeError(text string) string {
+	data, err := json.Marshal(text)
+	if err != nil {
+		return "other"
+	}
+	return categorizeError(data)
+}
+
 // ignoredErrorFamily 判断某类错误是否应该从 provider 错误率里忽略。
 //
 // 例如用户请求参数错误，不代表 provider 坏了。
@@ -1095,6 +1322,13 @@ func percentile(values []float64, p float64) *float64 {
 	value := sorted[idx]
 	// 返回局部变量地址在 Go 里是安全的，编译器会把它放到合适的位置。
 	return &value
+}
+
+// durationMilliseconds 把 time.Duration 转成浮点毫秒。
+//
+// 不用 duration.Milliseconds() 是因为它会截断小于 1ms 的测试样本。
+func durationMilliseconds(duration time.Duration) float64 {
+	return float64(duration) / float64(time.Millisecond)
 }
 
 // sortedFamilies 把 map 里的错误家族名转成排序后的切片。
