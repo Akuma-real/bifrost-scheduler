@@ -82,6 +82,53 @@ func TestHighErrorRateNeedsConsecutiveBadWindowsBeforeZeroWeight(t *testing.T) {
 	}
 }
 
+func TestMinWeightProbeDoesNotCreateNoopDecision(t *testing.T) {
+	cfg, err := normalizeConfig(Config{
+		Mode:            "guarded_write",
+		MinimumAttempts: 10,
+		Pools: []PoolConfig{
+			{
+				ID:                 "pool_a",
+				VirtualKey:         "vk_a",
+				MinActiveProviders: 1,
+				Providers:          []ProviderConfig{{Name: "provider_a", CostWeight: 0.7}},
+				Rules:              &PoolRules{RequiredBadWindows: 2, MinWeight: 0.05},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("normalizeConfig returned error: %v", err)
+	}
+
+	store := &fakeStore{
+		states: []PoolProviderState{
+			{PoolID: "pool_a", VirtualKey: "vk_a", Provider: "provider_a", CurrentWeight: 0.05, CurrentInBifrost: true},
+		},
+		metrics: []ProviderMetric{
+			{
+				PoolID:                "pool_a",
+				Provider:              "provider_a",
+				Total:                 20,
+				Errors:                20,
+				ErrorRate:             1,
+				BadWindows:            1,
+				ConsecutiveBadWindows: 1,
+			},
+		},
+	}
+
+	plan, err := NewPlanner(cfg, store, zeroTime()).BuildPlan(context.Background(), true)
+	if err != nil {
+		t.Fatalf("BuildPlan returned error: %v", err)
+	}
+	if len(plan.Decisions) != 0 {
+		t.Fatalf("decisions = %+v, want no-op min-weight probe omitted", plan.Decisions)
+	}
+	if store.weightCalls != 0 {
+		t.Fatalf("weightCalls = %d, want 0", store.weightCalls)
+	}
+}
+
 func TestCriticalErrorsNeedConsecutiveBadWindowsBeforeDisablingKeys(t *testing.T) {
 	cfg, err := normalizeConfig(Config{
 		MinimumAttempts: 10,
@@ -102,10 +149,10 @@ func TestCriticalErrorsNeedConsecutiveBadWindowsBeforeDisablingKeys(t *testing.T
 	state := PoolProviderState{Provider: "provider_a", CurrentWeight: 0.7, CurrentInBifrost: true}
 	metric := ProviderMetric{
 		Total:          20,
-		Success:        10,
-		Errors:         10,
-		ErrorRate:      0.5,
-		SuccessRate:    0.5,
+		Success:        2,
+		Errors:         18,
+		ErrorRate:      0.9,
+		SuccessRate:    0.1,
 		CriticalErrors: 2,
 	}
 	decision := planner.decideProvider(cfg.Pools[0], cfg.Pools[0].Providers[0], state, metric, 2)
@@ -125,6 +172,43 @@ func TestCriticalErrorsNeedConsecutiveBadWindowsBeforeDisablingKeys(t *testing.T
 	decision = planner.decideProvider(cfg.Pools[0], cfg.Pools[0].Providers[0], state, metric, 2)
 	if decision.Action != "disable_provider" {
 		t.Fatalf("decision = %+v, want disable_provider after consecutive bad windows", decision)
+	}
+}
+
+func TestCriticalErrorsDoNotDisableHealthyProvider(t *testing.T) {
+	cfg, err := normalizeConfig(Config{
+		MinimumAttempts: 10,
+		Pools: []PoolConfig{
+			{
+				ID:         "pool_a",
+				VirtualKey: "vk_a",
+				Providers:  []ProviderConfig{{Name: "provider_a", CostWeight: 0.7}},
+				Rules:      &PoolRules{CriticalErrorThreshold: 2, RequiredBadWindows: 2, DisableErrorRate: 0.8},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("normalizeConfig returned error: %v", err)
+	}
+
+	decision := NewPlanner(cfg, nil, zeroTime()).decideProvider(
+		cfg.Pools[0],
+		cfg.Pools[0].Providers[0],
+		PoolProviderState{Provider: "provider_a", CurrentWeight: 0.7, CurrentInBifrost: true},
+		ProviderMetric{
+			Total:                 100,
+			Success:               90,
+			Errors:                10,
+			ErrorRate:             0.1,
+			SuccessRate:           0.9,
+			CriticalErrors:        10,
+			BadWindows:            2,
+			ConsecutiveBadWindows: 2,
+		},
+		2,
+	)
+	if decision.Action != "keep" {
+		t.Fatalf("decision = %+v, want keep when critical errors are a minority of otherwise healthy traffic", decision)
 	}
 }
 
@@ -263,6 +347,34 @@ func TestDisableProviderDoesNotChangeWeightWhenKeyDisableFails(t *testing.T) {
 	}
 	if store.keyDisableCalls != 1 {
 		t.Fatalf("keyDisableCalls = %d, want 1", store.keyDisableCalls)
+	}
+	if store.weightCalls != 0 {
+		t.Fatalf("weightCalls = %d, want 0", store.weightCalls)
+	}
+}
+
+func TestApplyDecisionSkipsNoopWeightUpdate(t *testing.T) {
+	cfg, err := normalizeConfig(Config{
+		Mode: "guarded_write",
+		Pools: []PoolConfig{{
+			ID:         "pool_a",
+			VirtualKey: "vk_a",
+			Providers:  []ProviderConfig{{Name: "provider_a", CostWeight: 0.7}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("normalizeConfig returned error: %v", err)
+	}
+
+	store := &fakeStore{}
+	result := NewPlanner(cfg, store, zeroTime()).applyDecision(
+		context.Background(),
+		Decision{PoolID: "pool_a", Provider: "provider_a", Action: "set_weight", TargetWeight: 0.05},
+		[]PoolProviderState{{PoolID: "pool_a", Provider: "provider_a", CurrentWeight: 0.05, CurrentInBifrost: true}},
+	)
+
+	if !result.Skipped || result.Applied {
+		t.Fatalf("result = %+v, want skipped no-op", result)
 	}
 	if store.weightCalls != 0 {
 		t.Fatalf("weightCalls = %d, want 0", store.weightCalls)

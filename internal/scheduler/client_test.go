@@ -85,6 +85,12 @@ func TestClientLoadsProviderStatesAndMetrics(t *testing.T) {
 			if r.URL.Query().Get("virtual_key_ids") != "vk-1" {
 				t.Fatalf("virtual_key_ids query = %q", r.URL.Query().Get("virtual_key_ids"))
 			}
+			if got := r.URL.Query().Get("limit"); got != "100" {
+				t.Fatalf("limit query = %q, want 100", got)
+			}
+			if got := r.URL.Query().Get("end_time"); got == "" {
+				t.Fatalf("end_time query is empty")
+			}
 			return jsonResponse(t, map[string]any{
 				"logs": []any{
 					map[string]any{
@@ -112,8 +118,17 @@ func TestClientLoadsProviderStatesAndMetrics(t *testing.T) {
 							"error": map[string]any{"message": "insufficient_user_quota"},
 						},
 					},
+					map[string]any{
+						"provider":  "provider_a",
+						"status":    "error",
+						"timestamp": "2026-06-19T01:03:00Z",
+						"latency":   0,
+						"error_details": map[string]any{
+							"error": map[string]any{"type": "invalid_request_error", "message": "Instructions are required"},
+						},
+					},
 				},
-				"pagination": map[string]any{"total_count": 3},
+				"pagination": map[string]any{"total_count": 4},
 			}), nil
 		default:
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
@@ -150,8 +165,11 @@ func TestClientLoadsProviderStatesAndMetrics(t *testing.T) {
 		t.Fatalf("LoadMetrics returned error: %v", err)
 	}
 	metricA := metricFor(metrics, "provider_a")
-	if metricA.Total != 2 || metricA.Success != 1 || metricA.Errors != 1 || metricA.TimeoutOrStreamIdle != 1 {
+	if metricA.Total != 2 || metricA.Success != 1 || metricA.Errors != 1 || metricA.IgnoredErrors != 1 || metricA.TimeoutOrStreamIdle != 1 {
 		t.Fatalf("provider_a metric = %+v", metricA)
+	}
+	if !contains(metricA.IgnoredErrorFamilies, "client_request_error") {
+		t.Fatalf("provider_a ignored families = %+v, want client_request_error", metricA.IgnoredErrorFamilies)
 	}
 	metricB := metricFor(metrics, "provider_b")
 	if metricB.Total != 1 || metricB.CriticalErrors != 1 || !contains(metricB.ErrorFamilies, "quota_or_no_token") {
@@ -159,6 +177,13 @@ func TestClientLoadsProviderStatesAndMetrics(t *testing.T) {
 	}
 	if len(metricA.Windows) != 2 {
 		t.Fatalf("provider_a windows = %+v, want 2 windows", metricA.Windows)
+	}
+}
+
+func TestReadLimitedRejectsOversizedResponse(t *testing.T) {
+	_, err := readLimited(strings.NewReader("123456"), 5)
+	if err == nil || !strings.Contains(err.Error(), "response body exceeded 5 bytes") {
+		t.Fatalf("readLimited error = %v, want size error", err)
 	}
 }
 

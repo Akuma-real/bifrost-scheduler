@@ -148,7 +148,7 @@ func (p Planner) decide(states []PoolProviderState, metrics []ProviderMetric, ap
 			metric := metricsByPoolProvider[key(pool.ID, providerCfg.Name)]
 			decision := p.decideProvider(pool, providerCfg, state, metric, projectedActive)
 			decision.DryRun = !applyEnabled
-			if decision.Action == "keep" {
+			if decisionNoops(decision) {
 				continue
 			}
 			projectedActive = projectedActiveProviderCount(projectedActive, state, decision)
@@ -170,7 +170,7 @@ func (p Planner) decide(states []PoolProviderState, metrics []ProviderMetric, ap
 				action = "set_weight"
 				reason = "provider is missing from scheduler config, but keeping minimum weight to avoid dropping below min active providers"
 			}
-			decisions = append(decisions, Decision{
+			decision := Decision{
 				PoolID:        pool.ID,
 				VirtualKey:    pool.VirtualKey,
 				Provider:      state.Provider,
@@ -181,7 +181,11 @@ func (p Planner) decide(states []PoolProviderState, metrics []ProviderMetric, ap
 				Reason:        reason,
 				DryRun:        !applyEnabled,
 				Inputs:        decisionInputs(metric),
-			})
+			}
+			if decisionNoops(decision) {
+				continue
+			}
+			decisions = append(decisions, decision)
 			projectedActive = projectedActiveProviderCount(projectedActive, state, Decision{Action: action, TargetWeight: targetWeight})
 		}
 	}
@@ -258,7 +262,9 @@ func (p Planner) decideProvider(pool PoolConfig, provider ProviderConfig, state 
 		return base
 	}
 
-	if metric.CriticalErrors >= rules.CriticalErrorThreshold && metric.ConsecutiveBadWindows >= rules.RequiredBadWindows {
+	if metric.CriticalErrors >= rules.CriticalErrorThreshold &&
+		metric.ErrorRate >= rules.DisableErrorRate &&
+		metric.ConsecutiveBadWindows >= rules.RequiredBadWindows {
 		if activeNow <= pool.MinActiveProviders && currentWeight > 0 {
 			base.Action = "set_weight"
 			base.TargetWeight = minWeight
@@ -273,7 +279,9 @@ func (p Planner) decideProvider(pool PoolConfig, provider ProviderConfig, state 
 		return base
 	}
 
-	if metric.CriticalErrors >= rules.CriticalErrorThreshold && metric.BadWindows > 0 {
+	if metric.CriticalErrors >= rules.CriticalErrorThreshold &&
+		metric.ErrorRate >= rules.DisableErrorRate &&
+		metric.BadWindows > 0 {
 		base.Action = "set_weight"
 		base.TargetWeight = minWeight
 		base.Severity = "warning"
@@ -355,7 +363,7 @@ func badWindow(window WindowMetric, rules PoolRules, minimumAttempts int) bool {
 	if window.Total < minimumAttempts {
 		return false
 	}
-	if window.CriticalErrors >= rules.CriticalErrorThreshold {
+	if window.CriticalErrors >= rules.CriticalErrorThreshold && window.ErrorRate >= rules.DisableErrorRate {
 		return true
 	}
 	if window.Errors >= rules.MinErrors && window.ErrorRate >= rules.DisableErrorRate {
@@ -382,6 +390,9 @@ func (p Planner) applyDecision(ctx context.Context, decision Decision, states []
 
 	switch decision.Action {
 	case "set_weight", "set_weight_zero":
+		if weightsEqual(state.CurrentWeight, decision.TargetWeight) {
+			return ApplyResult{Skipped: true, Message: "provider weight already matches target"}
+		}
 		if err := p.repo.SetProviderWeight(ctx, state, decision.TargetWeight); err != nil {
 			return ApplyResult{Applied: false, Message: err.Error()}
 		}
@@ -400,9 +411,21 @@ func (p Planner) applyDecision(ctx context.Context, decision Decision, states []
 		}
 		return ApplyResult{Applied: true, Message: "provider weight set to zero and keys disabled"}
 	case "review_missing_provider":
-		return ApplyResult{Applied: false, Message: "manual Bifrost provider-config creation is required"}
+		return ApplyResult{Skipped: true, Message: "manual Bifrost provider-config creation is required"}
 	default:
-		return ApplyResult{Applied: false, Message: "action is not applyable"}
+		return ApplyResult{Skipped: true, Message: "action is not applyable"}
+	}
+}
+
+func decisionNoops(decision Decision) bool {
+	if decision.Action == "keep" {
+		return true
+	}
+	switch decision.Action {
+	case "set_weight", "set_weight_zero":
+		return weightsEqual(decision.CurrentWeight, decision.TargetWeight)
+	default:
+		return false
 	}
 }
 
@@ -465,6 +488,8 @@ func decisionInputs(metric ProviderMetric) DecisionInputs {
 		P95LatencyMS:           metric.P95LatencyMS,
 		TimeoutOrStreamIdle:    metric.TimeoutOrStreamIdle,
 		CriticalErrors:         metric.CriticalErrors,
+		IgnoredErrors:          metric.IgnoredErrors,
+		IgnoredErrorFamilies:   metric.IgnoredErrorFamilies,
 		ErrorFamilies:          metric.ErrorFamilies,
 		BadWindows:             metric.BadWindows,
 		ConsecutiveBadWindows:  metric.ConsecutiveBadWindows,
@@ -485,6 +510,10 @@ func clampWeight(value, min, max float64) float64 {
 		return max
 	}
 	return math.Round(value*10000) / 10000
+}
+
+func weightsEqual(a, b float64) bool {
+	return math.Abs(a-b) <= 0.001
 }
 
 func severityRank(severity string) int {

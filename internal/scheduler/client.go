@@ -161,7 +161,7 @@ func (c *BifrostClient) LoadMetrics(ctx context.Context, pools []PoolConfig, win
 			out = append(out, zeroMetrics(pool)...)
 			continue
 		}
-		logs, err := c.loadLogs(ctx, vk.ID, windowStart)
+		logs, err := c.loadLogs(ctx, vk.ID, windowStart, windowEnd)
 		if err != nil {
 			return nil, fmt.Errorf("load logs for pool %s: %w", pool.ID, err)
 		}
@@ -274,13 +274,16 @@ func (c *BifrostClient) getVirtualKey(ctx context.Context, id string) (virtualKe
 	return response.VirtualKey, nil
 }
 
-func (c *BifrostClient) loadLogs(ctx context.Context, virtualKeyID string, windowStart time.Time) ([]logEntry, error) {
-	const limit = 1000
+func (c *BifrostClient) loadLogs(ctx context.Context, virtualKeyID string, windowStart, windowEnd time.Time) ([]logEntry, error) {
+	const limit = 100
 	var out []logEntry
 	for offset := 0; ; offset += limit {
 		query := url.Values{}
 		query.Set("virtual_key_ids", virtualKeyID)
 		query.Set("start_time", windowStart.UTC().Format(time.RFC3339Nano))
+		if !windowEnd.IsZero() && windowEnd.After(windowStart) {
+			query.Set("end_time", windowEnd.UTC().Format(time.RFC3339Nano))
+		}
 		query.Set("limit", strconv.Itoa(limit))
 		query.Set("offset", strconv.Itoa(offset))
 		query.Set("sort_by", "timestamp")
@@ -290,7 +293,17 @@ func (c *BifrostClient) loadLogs(ctx context.Context, virtualKeyID string, windo
 		if _, err := c.doJSON(ctx, http.MethodGet, c.paths.Logs, query, nil, &response); err != nil {
 			return nil, err
 		}
-		out = append(out, response.Logs...)
+		reachedEnd := false
+		for _, log := range response.Logs {
+			if !windowEnd.IsZero() && windowEnd.After(windowStart) && !log.Timestamp.IsZero() && !log.Timestamp.Before(windowEnd) {
+				reachedEnd = true
+				continue
+			}
+			out = append(out, log)
+		}
+		if reachedEnd {
+			break
+		}
 		if len(response.Logs) < limit {
 			break
 		}
@@ -346,7 +359,7 @@ func (c *BifrostClient) doJSON(ctx context.Context, method, path string, query u
 	}
 	defer resp.Body.Close()
 
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	data, err := readLimited(resp.Body, maxAPIResponseBytes)
 	if err != nil {
 		return resp, fmt.Errorf("read response: %w", err)
 	}
@@ -360,6 +373,20 @@ func (c *BifrostClient) doJSON(ctx context.Context, method, path string, query u
 		return resp, fmt.Errorf("decode %s %s response: %w", method, requestURL, err)
 	}
 	return resp, nil
+}
+
+const maxAPIResponseBytes = 64 << 20
+
+func readLimited(r io.Reader, limit int64) ([]byte, error) {
+	limited := io.LimitReader(r, limit+1)
+	data, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("response body exceeded %d bytes", limit)
+	}
+	return data, nil
 }
 
 func (c *BifrostClient) resolve(path string, query url.Values) string {
@@ -652,20 +679,35 @@ type metricAccumulator struct {
 	latencies           []float64
 	timeoutOrStreamIdle int
 	criticalErrors      int
+	ignoredErrors       int
 	lastSeenAt          *time.Time
 	errorFamilies       map[string]bool
+	ignoredFamilies     map[string]bool
 }
 
 func (a *metricAccumulator) add(log logEntry) {
-	a.total++
 	if strings.EqualFold(log.Status, "success") {
+		a.total++
 		a.success++
 		if log.Latency > 0 {
 			a.latencies = append(a.latencies, log.Latency)
 		}
 	} else if strings.EqualFold(log.Status, "error") {
-		a.errors++
 		category := categorizeError(log.ErrorDetails)
+		if ignoredErrorFamily(category) {
+			a.ignoredErrors++
+			if a.ignoredFamilies == nil {
+				a.ignoredFamilies = map[string]bool{}
+			}
+			a.ignoredFamilies[category] = true
+			if !log.Timestamp.IsZero() && (a.lastSeenAt == nil || log.Timestamp.After(*a.lastSeenAt)) {
+				seen := log.Timestamp
+				a.lastSeenAt = &seen
+			}
+			return
+		}
+		a.total++
+		a.errors++
 		if a.errorFamilies == nil {
 			a.errorFamilies = map[string]bool{}
 		}
@@ -691,19 +733,21 @@ func (a *metricAccumulator) metric(pool PoolConfig, provider string) ProviderMet
 		successRate = float64(a.success) / float64(a.total)
 	}
 	return ProviderMetric{
-		PoolID:              pool.ID,
-		VirtualKey:          pool.VirtualKey,
-		Provider:            provider,
-		Total:               a.total,
-		Success:             a.success,
-		Errors:              a.errors,
-		ErrorRate:           errorRate,
-		SuccessRate:         successRate,
-		P95LatencyMS:        percentile(a.latencies, 0.95),
-		TimeoutOrStreamIdle: a.timeoutOrStreamIdle,
-		CriticalErrors:      a.criticalErrors,
-		LastSeenAt:          a.lastSeenAt,
-		ErrorFamilies:       sortedFamilies(a.errorFamilies),
+		PoolID:               pool.ID,
+		VirtualKey:           pool.VirtualKey,
+		Provider:             provider,
+		Total:                a.total,
+		Success:              a.success,
+		Errors:               a.errors,
+		ErrorRate:            errorRate,
+		SuccessRate:          successRate,
+		P95LatencyMS:         percentile(a.latencies, 0.95),
+		TimeoutOrStreamIdle:  a.timeoutOrStreamIdle,
+		CriticalErrors:       a.criticalErrors,
+		IgnoredErrors:        a.ignoredErrors,
+		LastSeenAt:           a.lastSeenAt,
+		ErrorFamilies:        sortedFamilies(a.errorFamilies),
+		IgnoredErrorFamilies: sortedFamilies(a.ignoredFamilies),
 	}
 }
 
@@ -725,6 +769,7 @@ func (a *metricAccumulator) windowMetric(start, end time.Time) WindowMetric {
 		P95LatencyMS:        percentile(a.latencies, 0.95),
 		TimeoutOrStreamIdle: a.timeoutOrStreamIdle,
 		CriticalErrors:      a.criticalErrors,
+		IgnoredErrors:       a.ignoredErrors,
 	}
 }
 
@@ -759,6 +804,12 @@ func categorizeError(raw json.RawMessage) string {
 		return "service_unavailable"
 	case strings.Contains(text, "image generation is not enabled for this group"):
 		return "image_group_disabled"
+	case strings.Contains(text, "instructions are required"),
+		strings.Contains(text, "unsupported_value"),
+		strings.Contains(text, "invalid_request_error"),
+		strings.Contains(text, "permission_error"),
+		strings.Contains(text, "request cancelled: client disconnected"):
+		return "client_request_error"
 	case strings.Contains(text, "no available channel for model"),
 		strings.Contains(text, "model_not_found"):
 		return "model_unavailable"
@@ -766,6 +817,15 @@ func categorizeError(raw json.RawMessage) string {
 		return "client_disconnected"
 	default:
 		return "other"
+	}
+}
+
+func ignoredErrorFamily(family string) bool {
+	switch family {
+	case "client_request_error", "client_disconnected", "image_group_disabled":
+		return true
+	default:
+		return false
 	}
 }
 

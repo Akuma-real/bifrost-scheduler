@@ -29,6 +29,8 @@ type ProviderMetric struct {
 	P95LatencyMS           *float64       `json:"p95_latency_ms,omitempty"`
 	TimeoutOrStreamIdle    int            `json:"timeout_or_stream_idle"`
 	CriticalErrors         int            `json:"critical_errors"`
+	IgnoredErrors          int            `json:"ignored_errors,omitempty"`
+	IgnoredErrorFamilies   []string       `json:"ignored_error_families,omitempty"`
 	LastSeenAt             *time.Time     `json:"last_seen_at,omitempty"`
 	ErrorFamilies          []string       `json:"error_families,omitempty"`
 	Windows                []WindowMetric `json:"-"`
@@ -61,6 +63,8 @@ type DecisionInputs struct {
 	P95LatencyMS           *float64 `json:"p95_latency_ms,omitempty"`
 	TimeoutOrStreamIdle    int      `json:"timeout_or_stream_idle"`
 	CriticalErrors         int      `json:"critical_errors"`
+	IgnoredErrors          int      `json:"ignored_errors,omitempty"`
+	IgnoredErrorFamilies   []string `json:"ignored_error_families,omitempty"`
 	ErrorFamilies          []string `json:"error_families,omitempty"`
 	BadWindows             int      `json:"bad_windows,omitempty"`
 	ConsecutiveBadWindows  int      `json:"consecutive_bad_windows,omitempty"`
@@ -80,12 +84,14 @@ type WindowMetric struct {
 	P95LatencyMS        *float64  `json:"p95_latency_ms,omitempty"`
 	TimeoutOrStreamIdle int       `json:"timeout_or_stream_idle"`
 	CriticalErrors      int       `json:"critical_errors"`
+	IgnoredErrors       int       `json:"ignored_errors,omitempty"`
 	Bad                 bool      `json:"bad"`
 	Slow                bool      `json:"slow"`
 }
 
 type ApplyResult struct {
 	Applied bool   `json:"applied"`
+	Skipped bool   `json:"skipped,omitempty"`
 	Message string `json:"message"`
 }
 

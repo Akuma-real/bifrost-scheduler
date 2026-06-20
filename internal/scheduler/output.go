@@ -52,6 +52,13 @@ func (p Plan) Markdown() string {
 			if len(d.Inputs.ErrorFamilies) > 0 {
 				fmt.Fprintf(&b, "   - 错误类型：`%s`\n", strings.Join(d.Inputs.ErrorFamilies, "`, `"))
 			}
+			if d.Inputs.IgnoredErrors > 0 {
+				fmt.Fprintf(&b, "   - 已忽略用户侧错误：`%d`", d.Inputs.IgnoredErrors)
+				if len(d.Inputs.IgnoredErrorFamilies) > 0 {
+					fmt.Fprintf(&b, "，类型：`%s`", strings.Join(d.Inputs.IgnoredErrorFamilies, "`, `"))
+				}
+				fmt.Fprintf(&b, "\n")
+			}
 			fmt.Fprintf(&b, "   - 原因：%s\n", humanReason(d))
 			if d.Apply != nil {
 				fmt.Fprintf(&b, "   - 执行结果：%s\n", humanApply(*d.Apply))
@@ -84,11 +91,11 @@ func (p Plan) Markdown() string {
 	}
 
 	fmt.Fprintf(&b, "\n## 最近指标\n\n")
-	fmt.Fprintf(&b, "| Pool | Provider | 请求 | 成功 | 失败 | 错误率 | P95 ms | Timeout/Idle | 关键错误 | 连续坏窗口 | 连续慢窗口 |\n")
-	fmt.Fprintf(&b, "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n")
+	fmt.Fprintf(&b, "| Pool | Provider | 有效请求 | 成功 | 失败 | 忽略错误 | 错误率 | P95 ms | Timeout/Idle | 关键错误 | 连续坏窗口 | 连续慢窗口 |\n")
+	fmt.Fprintf(&b, "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n")
 	for _, metric := range p.Metrics {
-		fmt.Fprintf(&b, "| `%s` | `%s` | %d | %d | %d | %s | %s | %d | %d | %d | %d |\n",
-			metric.PoolID, metric.Provider, metric.Total, metric.Success, metric.Errors, percent(metric.ErrorRate),
+		fmt.Fprintf(&b, "| `%s` | `%s` | %d | %d | %d | %d | %s | %s | %d | %d | %d | %d |\n",
+			metric.PoolID, metric.Provider, metric.Total, metric.Success, metric.Errors, metric.IgnoredErrors, percent(metric.ErrorRate),
 			formatFloat(metric.P95LatencyMS), metric.TimeoutOrStreamIdle, metric.CriticalErrors, metric.ConsecutiveBadWindows, metric.ConsecutiveSlowWindows)
 	}
 	return b.String()
@@ -99,6 +106,9 @@ func (d Decision) HumanSummary() string {
 	case "set_weight_zero":
 		return fmt.Sprintf("把 `%s` 的权重清零", d.Provider)
 	case "set_weight":
+		if weightsEqual(d.TargetWeight, d.CurrentWeight) {
+			return fmt.Sprintf("保持 `%s` 的权重为 %.4f", d.Provider, d.TargetWeight)
+		}
 		if d.TargetWeight > d.CurrentWeight {
 			return fmt.Sprintf("把 `%s` 的权重提高到 %.4f", d.Provider, d.TargetWeight)
 		}

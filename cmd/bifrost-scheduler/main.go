@@ -167,6 +167,7 @@ func logPlanSummary(logger *slog.Logger, plan scheduler.Plan) {
 	critical := 0
 	warning := 0
 	applied := 0
+	skipped := 0
 	failed := 0
 	for _, decision := range plan.Decisions {
 		switch decision.Severity {
@@ -180,6 +181,8 @@ func logPlanSummary(logger *slog.Logger, plan scheduler.Plan) {
 		}
 		if decision.Apply.Applied {
 			applied++
+		} else if decision.Apply.Skipped {
+			skipped++
 		} else {
 			failed++
 		}
@@ -192,6 +195,7 @@ func logPlanSummary(logger *slog.Logger, plan scheduler.Plan) {
 		"critical", critical,
 		"warning", warning,
 		"applied", applied,
+		"skipped", skipped,
 		"failed", failed,
 	)
 }
