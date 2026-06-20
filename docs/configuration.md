@@ -361,7 +361,7 @@ BIFROST_SCHEDULER_TG_INTERACTIVE=true
 | --- | --- | --- | --- | --- | --- |
 | `max_error_rate` | number | 否 | `0.5` | `0` 到 `1` | 错误率大于该值时，建议降权到 `cost_weight * (1 - error_rate)`，不低于 `min_weight`。 |
 | `disable_error_rate` | number | 否 | `0.8` | `0` 到 `1` | 错误率大于等于该值，且连续坏窗口达标时，建议权重清零。 |
-| `max_timeout_or_idle` | integer | 否 | `10` | `0` 或正整数 | 单窗口超时或 stream idle 次数大于该值时，该窗口算坏窗口。`0` 表示关闭该规则。 |
+| `max_timeout_or_idle` | integer | 否 | `10` | 正整数 | 单窗口超时或 stream idle 次数大于该值时，该窗口算坏窗口。不写或写 `0` 都会使用默认值 `10`。 |
 | `max_p95_latency_ms` | number | 否 | `0` | `0` 或正数 | 单窗口成功请求 P95 延迟大于该值时，该窗口算慢窗口。连续慢窗口达标才建议权重减半。默认 `0`，表示只展示延迟，不因延迟自动调权。 |
 | `max_p95_ttft_ms` | number | 否 | `0` | `0` 或正数 | 主动测速首字 P95 大于该值时建议降权。默认 `0`，表示不按绝对首字阈值降权。 |
 | `min_success_rate_for_recovery` | number | 否 | `0.95` | `0` 到 `1` | 成功率达到该值时，才允许从 0 恢复或恢复到目标权重。 |
@@ -372,6 +372,7 @@ BIFROST_SCHEDULER_TG_INTERACTIVE=true
 | `required_bad_windows` | integer | 否 | `2` | 正整数 | 允许清零或禁用前，需要达到的连续坏窗口数。 |
 | `ttft_priority` | number | 否 | `0.75` | `0` 到 `1` | 首字速度在“首字 + 成本”综合目标权重中的占比。`0.75` 表示首字优先。 |
 | `min_weight_change` | number | 否 | `0.02` | `0` 或正数 | 计算出的目标权重和当前权重差距小于该值时不生成动作，避免频繁抖动。 |
+| `max_weight_step` | number | 否 | `0.2` | 正数 | 健康恢复和主动测速健康调权的单轮最大权重变化。异常降权不受这个限制，仍可快速降到探测权重。 |
 | `default_cost_weight` | number | 否 | `1` | 正数 | provider 没写 `cost_weight` 时使用的健康目标权重。 |
 | `min_weight` | number | 否 | `0.05` | `0` 或正数 | provider 没写 `min_weight` 时使用的最小探测/保护权重。 |
 

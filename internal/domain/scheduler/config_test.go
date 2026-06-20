@@ -122,3 +122,31 @@ func TestDefaultCostWeight(t *testing.T) {
 		t.Fatalf("default_cost_weight = %.2f, want 1", rules.DefaultCostWeight)
 	}
 }
+
+// TestPartialRulesKeepDefaults 验证只写一部分 rules 时，其他默认保护规则不会丢。
+func TestPartialRulesKeepDefaults(t *testing.T) {
+	cfg, err := NormalizeConfig(Config{
+		Pools: []PoolConfig{
+			{
+				ID:         "gpt_low",
+				VirtualKey: "vk_low_text",
+				Providers:  []ProviderConfig{{Name: "provider_a"}},
+				Rules:      &PoolRules{MinWeightChange: 0.05},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NormalizeConfig returned error: %v", err)
+	}
+
+	rules := cfg.Pools[0].EffectiveRules()
+	if rules.MaxTimeoutOrIdle != 10 {
+		t.Fatalf("max_timeout_or_idle = %d, want default 10", rules.MaxTimeoutOrIdle)
+	}
+	if rules.MaxWeightStep != 0.2 {
+		t.Fatalf("max_weight_step = %.2f, want default 0.2", rules.MaxWeightStep)
+	}
+	if rules.MinWeightChange != 0.05 {
+		t.Fatalf("min_weight_change = %.2f, want configured 0.05", rules.MinWeightChange)
+	}
+}

@@ -131,6 +131,9 @@ type PoolRules struct {
 	TTFTPriority float64 `json:"ttft_priority"`
 	// MinWeightChange 是最小权重变动幅度，小于它就不写回，避免权重频繁抖动。
 	MinWeightChange float64 `json:"min_weight_change"`
+	// MaxWeightStep 是单轮健康调权最大步长。
+	// 主动测速只有少量样本时，不能每 5 分钟把健康 provider 大幅拉上拉下。
+	MaxWeightStep float64 `json:"max_weight_step"`
 	// DefaultCostWeight 是 provider 没写 cost_weight 时的默认目标权重。
 	DefaultCostWeight float64 `json:"default_cost_weight"`
 	// MinWeight 是探测权重默认值。
@@ -360,6 +363,7 @@ func DefaultPoolRules() PoolRules {
 		RequiredBadWindows:        2,
 		TTFTPriority:              0.75,
 		MinWeightChange:           0.02,
+		MaxWeightStep:             0.2,
 		DefaultCostWeight:         1,
 		MinWeight:                 0.05,
 	}
@@ -377,6 +381,9 @@ func normalizePoolRules(rules *PoolRules) {
 	}
 	if rules.DisableErrorRate <= 0 {
 		rules.DisableErrorRate = defaults.DisableErrorRate
+	}
+	if rules.MaxTimeoutOrIdle <= 0 {
+		rules.MaxTimeoutOrIdle = defaults.MaxTimeoutOrIdle
 	}
 	if rules.MinSuccessRateForRecovery <= 0 {
 		rules.MinSuccessRateForRecovery = defaults.MinSuccessRateForRecovery
@@ -404,6 +411,9 @@ func normalizePoolRules(rules *PoolRules) {
 	}
 	if rules.MinWeightChange <= 0 {
 		rules.MinWeightChange = defaults.MinWeightChange
+	}
+	if rules.MaxWeightStep <= 0 {
+		rules.MaxWeightStep = defaults.MaxWeightStep
 	}
 	if rules.DefaultCostWeight <= 0 {
 		rules.DefaultCostWeight = defaults.DefaultCostWeight

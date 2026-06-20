@@ -174,7 +174,7 @@ func (s DecisionService) Decide(states []PoolProviderState, metrics []ProviderMe
 			reason := "provider is present in Bifrost VK but missing from scheduler config"
 			// 但如果这是最后一个活跃 provider，就只降到最小权重，避免池子不可用。
 			if projectedActive <= pool.MinActiveProviders && state.CurrentWeight > 0 {
-				targetWeight = pool.EffectiveRules().MinWeight
+				targetWeight = degradedTargetWeight(state.CurrentWeight, pool.EffectiveRules().MinWeight)
 				action = "set_weight"
 				reason = "provider is missing from scheduler config, but keeping minimum weight to avoid dropping below min active providers"
 			}
@@ -342,6 +342,10 @@ func (s DecisionService) decideProvider(pool PoolConfig, provider ProviderConfig
 		if decision, ok := s.probeDecision(base, rules, metric, currentWeight, targetWeight, minWeight, probeTarget, hasProbeTarget); ok {
 			return decision
 		}
+		// 主动测速已经证明异常时，不能因为业务日志样本少就重新给权重。
+		if s.hasDegradationEvidence(rules, metric) {
+			return base
+		}
 		// 如果没有流量且权重为 0，给它一点点探测权重，让系统能重新收集证据。
 		if currentWeight == 0 && targetWeight > 0 {
 			base.Action = "set_weight"
@@ -360,8 +364,12 @@ func (s DecisionService) decideProvider(pool PoolConfig, provider ProviderConfig
 		metric.ConsecutiveBadWindows >= rules.RequiredBadWindows {
 		// 安全底线：不能把最后一个活跃 provider 直接禁掉。
 		if activeNow <= pool.MinActiveProviders && currentWeight > 0 {
+			target := degradedTargetWeight(currentWeight, minWeight)
+			if WeightsEqual(currentWeight, target) {
+				return base
+			}
 			base.Action = "set_weight"
-			base.TargetWeight = minWeight
+			base.TargetWeight = target
 			base.Severity = "critical"
 			base.Reason = "disable threshold reached, but keeping minimum weight to avoid dropping below min active providers"
 			return base
@@ -378,8 +386,12 @@ func (s DecisionService) decideProvider(pool PoolConfig, provider ProviderConfig
 	if metric.CriticalErrors >= rules.CriticalErrorThreshold &&
 		metric.ErrorRate >= rules.DisableErrorRate &&
 		metric.BadWindows > 0 {
+		target := degradedTargetWeight(currentWeight, minWeight)
+		if WeightsEqual(currentWeight, target) {
+			return base
+		}
 		base.Action = "set_weight"
-		base.TargetWeight = minWeight
+		base.TargetWeight = target
 		base.Severity = "warning"
 		base.Reason = fmt.Sprintf("critical credential/quota errors observed: %d; not disabling until %d consecutive bad windows", metric.CriticalErrors, rules.RequiredBadWindows)
 		return base
@@ -388,8 +400,12 @@ func (s DecisionService) decideProvider(pool PoolConfig, provider ProviderConfig
 	// 普通错误率达到禁用阈值，并且已经连续坏了足够窗口。
 	if metric.Errors >= rules.MinErrors && metric.ErrorRate >= rules.DisableErrorRate && metric.ConsecutiveBadWindows >= rules.RequiredBadWindows {
 		if activeNow <= pool.MinActiveProviders && currentWeight > 0 {
+			target := degradedTargetWeight(currentWeight, minWeight)
+			if WeightsEqual(currentWeight, target) {
+				return base
+			}
 			base.Action = "set_weight"
-			base.TargetWeight = minWeight
+			base.TargetWeight = target
 			base.Severity = "critical"
 			base.Reason = "disable threshold reached, but keeping minimum weight to avoid dropping below min active providers"
 			return base
@@ -403,8 +419,12 @@ func (s DecisionService) decideProvider(pool PoolConfig, provider ProviderConfig
 
 	// 普通错误率已经很高，但连续窗口证据还不够，先降到探测权重。
 	if metric.Errors >= rules.MinErrors && metric.ErrorRate >= rules.DisableErrorRate && metric.BadWindows > 0 {
+		target := degradedTargetWeight(currentWeight, minWeight)
+		if WeightsEqual(currentWeight, target) {
+			return base
+		}
 		base.Action = "set_weight"
-		base.TargetWeight = minWeight
+		base.TargetWeight = target
 		base.Severity = "warning"
 		base.Reason = fmt.Sprintf("error rate %.2f%% reached disable threshold, but only %d consecutive bad windows", metric.ErrorRate*100, metric.ConsecutiveBadWindows)
 		return base
@@ -412,8 +432,12 @@ func (s DecisionService) decideProvider(pool PoolConfig, provider ProviderConfig
 
 	// timeout / stream idle 太多，也先降到探测权重。
 	if rules.MaxTimeoutOrIdle > 0 && metric.TimeoutOrStreamIdle > rules.MaxTimeoutOrIdle && metric.Errors >= rules.MinErrors && metric.BadWindows > 0 {
+		target := degradedTargetWeight(currentWeight, minWeight)
+		if WeightsEqual(currentWeight, target) {
+			return base
+		}
 		base.Action = "set_weight"
-		base.TargetWeight = minWeight
+		base.TargetWeight = target
 		base.Severity = "warning"
 		base.Reason = fmt.Sprintf("timeout/stream idle count %d exceeded %d", metric.TimeoutOrStreamIdle, rules.MaxTimeoutOrIdle)
 		return base
@@ -421,8 +445,12 @@ func (s DecisionService) decideProvider(pool PoolConfig, provider ProviderConfig
 
 	// 错误率超过普通阈值，但没到禁用阈值，就按错误率比例降权。
 	if metric.Errors >= rules.MinErrors && metric.ErrorRate > rules.MaxErrorRate && metric.BadWindows > 0 {
+		target := degradedTargetWeight(currentWeight, ClampWeight(targetWeight*(1-metric.ErrorRate), minWeight, targetWeight))
+		if WeightsEqual(currentWeight, target) {
+			return base
+		}
 		base.Action = "set_weight"
-		base.TargetWeight = ClampWeight(targetWeight*(1-metric.ErrorRate), minWeight, targetWeight)
+		base.TargetWeight = target
 		base.Severity = "warning"
 		base.Reason = fmt.Sprintf("error rate %.2f%% exceeded %.2f%%", metric.ErrorRate*100, rules.MaxErrorRate*100)
 		return base
@@ -434,8 +462,12 @@ func (s DecisionService) decideProvider(pool PoolConfig, provider ProviderConfig
 		metric.Success >= rules.MinLatencySamples &&
 		*metric.P95LatencyMS > rules.MaxP95LatencyMS &&
 		metric.ConsecutiveSlowWindows >= rules.RequiredBadWindows {
+		target := degradedTargetWeight(currentWeight, ClampWeight(targetWeight*0.5, minWeight, targetWeight))
+		if WeightsEqual(currentWeight, target) {
+			return base
+		}
 		base.Action = "set_weight"
-		base.TargetWeight = ClampWeight(targetWeight*0.5, minWeight, targetWeight)
+		base.TargetWeight = target
 		base.Severity = "warning"
 		base.Reason = fmt.Sprintf("p95 latency %.0fms exceeded %.0fms across %d consecutive slow windows", *metric.P95LatencyMS, rules.MaxP95LatencyMS, metric.ConsecutiveSlowWindows)
 		return base
@@ -444,6 +476,16 @@ func (s DecisionService) decideProvider(pool PoolConfig, provider ProviderConfig
 	// 真实业务错误已经排除后，再用主动测速做首字优先和成本调权。
 	if decision, ok := s.probeDecision(base, rules, metric, currentWeight, targetWeight, minWeight, probeTarget, hasProbeTarget); ok {
 		return decision
+	}
+
+	// 如果本轮已经有“应该降权或至少不恢复”的证据，后面的恢复逻辑必须停住。
+	//
+	// 这里修复的是一类矛盾：
+	// 前面异常分支发现 provider 坏了，但目标权重刚好等于当前权重，于是没有动作；
+	// 如果不拦截，下面的“成功率达标恢复”会立刻把它提高，通知就会变成
+	// “因为错误率高所以提高权重”。
+	if s.hasDegradationEvidence(rules, metric) {
+		return base
 	}
 
 	// 当前权重为 0，但最近成功率已经达标，就用最小权重重新放一点流量。
@@ -456,9 +498,13 @@ func (s DecisionService) decideProvider(pool PoolConfig, provider ProviderConfig
 	}
 
 	// 当前权重不是目标权重，并且 provider 健康，就恢复到 cost_weight。
-	if currentWeight > 0 && math.Abs(currentWeight-targetWeight) > 0.001 && metric.SuccessRate >= rules.MinSuccessRateForRecovery {
+	if currentWeight > 0 && math.Abs(currentWeight-targetWeight) >= rules.MinWeightChange && metric.SuccessRate >= rules.MinSuccessRateForRecovery {
+		target := steppedTargetWeight(currentWeight, targetWeight, rules.MaxWeightStep)
+		if WeightsEqual(currentWeight, target) {
+			return base
+		}
 		base.Action = "set_weight"
-		base.TargetWeight = targetWeight
+		base.TargetWeight = target
 		base.Severity = "info"
 		base.Reason = "provider is healthy; restore configured base weight"
 		return base
@@ -482,8 +528,12 @@ func (s DecisionService) probeDecision(base Decision, rules PoolRules, metric Pr
 		if currentWeight == 0 {
 			return Decision{}, false
 		}
+		target := degradedTargetWeight(currentWeight, minWeight)
+		if WeightsEqual(currentWeight, target) {
+			return Decision{}, false
+		}
 		base.Action = "set_weight"
-		base.TargetWeight = minWeight
+		base.TargetWeight = target
 		base.Severity = "warning"
 		base.Reason = fmt.Sprintf("active probe error rate %.2f%% exceeded %.2f%%", metric.ProbeErrorRate*100, rules.MaxErrorRate*100)
 		return base, true
@@ -497,8 +547,12 @@ func (s DecisionService) probeDecision(base Decision, rules PoolRules, metric Pr
 		if currentWeight == 0 {
 			return Decision{}, false
 		}
+		target := degradedTargetWeight(currentWeight, ClampWeight(targetWeight*0.5, minWeight, targetWeight))
+		if WeightsEqual(currentWeight, target) {
+			return Decision{}, false
+		}
 		base.Action = "set_weight"
-		base.TargetWeight = ClampWeight(targetWeight*0.5, minWeight, targetWeight)
+		base.TargetWeight = target
 		base.Severity = "warning"
 		base.Reason = fmt.Sprintf("probe p95 ttft %.0fms exceeded %.0fms", *metric.P95TTFTMS, rules.MaxP95TTFTMS)
 		return base, true
@@ -513,13 +567,103 @@ func (s DecisionService) probeDecision(base Decision, rules PoolRules, metric Pr
 		return base, true
 	}
 	if hasProbeTarget && math.Abs(currentWeight-probeTarget) >= rules.MinWeightChange {
+		target := steppedTargetWeight(currentWeight, probeTarget, rules.MaxWeightStep)
+		if WeightsEqual(currentWeight, target) {
+			return Decision{}, false
+		}
 		base.Action = "set_weight"
-		base.TargetWeight = probeTarget
+		base.TargetWeight = target
 		base.Severity = "info"
 		base.Reason = "active probe ttft priority adjusted weight"
 		return base, true
 	}
 	return Decision{}, false
+}
+
+// degradedTargetWeight 给所有“异常导致降权”的分支兜底。
+//
+// 这些分支的语义是“变坏了，所以降低或保持权重”。
+// 如果公式算出的目标比当前权重更高，就保持当前权重，避免出现
+// “因为错误率高，所以把权重提高”的矛盾动作。
+func degradedTargetWeight(currentWeight, targetWeight float64) float64 {
+	if currentWeight <= 0 {
+		return 0
+	}
+	if targetWeight > currentWeight {
+		return currentWeight
+	}
+	return targetWeight
+}
+
+// steppedTargetWeight 给“健康调权”限速。
+//
+// 主动测速是少量样本，适合提示方向，不适合每轮把权重大幅跳变。
+// 这个函数只限制健康恢复/首字优先调权；异常降权仍然可以快速执行。
+func steppedTargetWeight(currentWeight, targetWeight, maxStep float64) float64 {
+	if maxStep <= 0 {
+		return targetWeight
+	}
+	if targetWeight > currentWeight+maxStep {
+		return ClampWeight(currentWeight+maxStep, 0, 1)
+	}
+	if targetWeight < currentWeight-maxStep {
+		return ClampWeight(currentWeight-maxStep, 0, 1)
+	}
+	return targetWeight
+}
+
+// hasDegradationEvidence 判断“本轮有没有明确的异常证据”。
+//
+// 它不直接生成动作，只回答一个问题：
+// 后面的恢复逻辑现在能不能把权重拉高？
+//
+// 返回 true 时表示不能恢复。原因可能来自两类：
+//   - Bifrost 真实业务日志：错误率、关键错误、timeout/idle、慢窗口。
+//   - 调度器主动测速：测速失败率高，或者首字 P95 超过阈值。
+func (s DecisionService) hasDegradationEvidence(rules PoolRules, metric ProviderMetric) bool {
+	if metric.CriticalErrors >= rules.CriticalErrorThreshold &&
+		metric.ErrorRate >= rules.DisableErrorRate &&
+		metric.BadWindows > 0 {
+		return true
+	}
+	if metric.Errors >= rules.MinErrors &&
+		metric.ErrorRate >= rules.DisableErrorRate &&
+		metric.BadWindows > 0 {
+		return true
+	}
+	if rules.MaxTimeoutOrIdle > 0 &&
+		metric.TimeoutOrStreamIdle > rules.MaxTimeoutOrIdle &&
+		metric.Errors >= rules.MinErrors &&
+		metric.BadWindows > 0 {
+		return true
+	}
+	if metric.Errors >= rules.MinErrors &&
+		metric.ErrorRate > rules.MaxErrorRate &&
+		metric.BadWindows > 0 {
+		return true
+	}
+	if metric.P95LatencyMS != nil &&
+		rules.MaxP95LatencyMS > 0 &&
+		metric.Success >= rules.MinLatencySamples &&
+		*metric.P95LatencyMS > rules.MaxP95LatencyMS &&
+		metric.SlowWindows > 0 {
+		return true
+	}
+	if !s.cfg.Probe.Enabled {
+		return false
+	}
+	if metric.ProbeTotal >= rules.MinProbeSamples &&
+		metric.ProbeErrors > 0 &&
+		metric.ProbeErrorRate >= rules.MaxErrorRate {
+		return true
+	}
+	if metric.P95TTFTMS != nil &&
+		rules.MaxP95TTFTMS > 0 &&
+		metric.ProbeSuccess >= rules.MinProbeSamples &&
+		*metric.P95TTFTMS > rules.MaxP95TTFTMS {
+		return true
+	}
+	return false
 }
 
 // probeAwareTargetWeights 按“首字优先，其次成本”计算每个 provider 的健康目标权重。

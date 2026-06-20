@@ -16,6 +16,7 @@ func TestCostWeightIsHealthyTargetWeight(t *testing.T) {
 				ID:         "pool_a",
 				VirtualKey: "vk_a",
 				Providers:  []ProviderConfig{{Name: "provider_a", CostWeight: 0.35}},
+				Rules:      &PoolRules{MaxWeightStep: 1},
 			},
 		},
 	})
@@ -37,6 +38,34 @@ func TestCostWeightIsHealthyTargetWeight(t *testing.T) {
 
 	if decision.Action != "set_weight" || decision.TargetWeight != 0.35 {
 		t.Fatalf("decision = %+v, want set_weight to 0.35", decision)
+	}
+}
+
+// TestHealthyRecoveryIsStepLimitedByDefault 验证默认健康恢复不会一步大跳。
+func TestHealthyRecoveryIsStepLimitedByDefault(t *testing.T) {
+	cfg, err := NormalizeConfig(Config{
+		MinimumAttempts: 1,
+		Pools: []PoolConfig{
+			{
+				ID:         "pool_a",
+				VirtualKey: "vk_a",
+				Providers:  []ProviderConfig{{Name: "provider_a", CostWeight: 0.8}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NormalizeConfig returned error: %v", err)
+	}
+
+	decision := NewDecisionService(cfg).DecideProvider(
+		cfg.Pools[0],
+		cfg.Pools[0].Providers[0],
+		PoolProviderState{Provider: "provider_a", CurrentWeight: 0.1, CurrentInBifrost: true},
+		ProviderMetric{Total: 10, Success: 10, SuccessRate: 1},
+		1,
+	)
+	if decision.Action != "set_weight" || decision.TargetWeight != 0.3 {
+		t.Fatalf("decision = %+v, want default step-limited recovery to 0.3", decision)
 	}
 }
 
@@ -133,6 +162,166 @@ func TestMinWeightProbeDoesNotCreateNoopDecision(t *testing.T) {
 	)
 	if len(decisions) != 0 {
 		t.Fatalf("decisions = %+v, want no-op min-weight probe omitted", decisions)
+	}
+}
+
+// TestDegradedBranchDoesNotIncreaseWeight 验证异常/降权分支不能反向提高权重。
+//
+// 线上曾出现过这种矛盾：
+// 当前权重已经是 0.05，主动测速 0/2 失败，但公式目标是 0.4231，
+// 结果通知显示“提高权重”，原因却是“错误率超过阈值，降低权重”。
+func TestDegradedBranchDoesNotIncreaseWeight(t *testing.T) {
+	cfg, err := NormalizeConfig(Config{
+		Mode:            "guarded_write",
+		MinimumAttempts: 10,
+		Probe:           ProbeConfig{Enabled: true, Model: "gpt-5.5", Samples: 2},
+		Pools: []PoolConfig{
+			{
+				ID:                 "pool_a",
+				VirtualKey:         "vk_a",
+				MinActiveProviders: 1,
+				Providers:          []ProviderConfig{{Name: "provider_a", CostWeight: 1}},
+				Rules: &PoolRules{
+					MinWeight:       0.05,
+					MinProbeSamples: 2,
+					MaxErrorRate:    0.5,
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NormalizeConfig returned error: %v", err)
+	}
+
+	decision := NewDecisionService(cfg).DecideProvider(
+		cfg.Pools[0],
+		cfg.Pools[0].Providers[0],
+		PoolProviderState{Provider: "provider_a", CurrentWeight: 0.05, CurrentInBifrost: true},
+		ProviderMetric{
+			Total:          100,
+			Success:        100,
+			SuccessRate:    1,
+			ProbeTotal:     2,
+			ProbeErrors:    2,
+			ProbeErrorRate: 1,
+		},
+		2,
+	)
+	if decision.Action != "keep" {
+		t.Fatalf("decision = %+v, want keep because degraded branch must not raise min-weight provider", decision)
+	}
+}
+
+// TestErrorRateDegradationFromProductionLogDoesNotIncreaseWeight 复刻生产日志里的矛盾场景。
+//
+// 生产曾出现：错误率 57.14%，原因写“降低权重”，但动作是 0.4231 -> 0.4286。
+// 这类异常证据存在时，目标权重即使公式算得更高，也必须保持当前或降低。
+func TestErrorRateDegradationFromProductionLogDoesNotIncreaseWeight(t *testing.T) {
+	cfg, err := NormalizeConfig(Config{
+		Mode:            "guarded_write",
+		MinimumAttempts: 10,
+		Probe:           ProbeConfig{Enabled: true, Model: "gpt-5.5", Samples: 2},
+		Pools: []PoolConfig{
+			{
+				ID:         "pool_a",
+				VirtualKey: "vk_a",
+				Providers:  []ProviderConfig{{Name: "provider_a", CostWeight: 1}},
+				Rules: &PoolRules{
+					MinWeight:          0.05,
+					MinProbeSamples:    2,
+					MaxErrorRate:       0.5,
+					DisableErrorRate:   0.8,
+					MinErrors:          3,
+					RequiredBadWindows: 2,
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NormalizeConfig returned error: %v", err)
+	}
+
+	ttft := 9035.0
+	decision := NewDecisionService(cfg).DecideProvider(
+		cfg.Pools[0],
+		cfg.Pools[0].Providers[0],
+		PoolProviderState{Provider: "provider_a", CurrentWeight: 0.4231, CurrentInBifrost: true},
+		ProviderMetric{
+			Total:                 28,
+			Success:               12,
+			Errors:                16,
+			ErrorRate:             0.5714,
+			SuccessRate:           0.4286,
+			BadWindows:            1,
+			ConsecutiveBadWindows: 1,
+			ProbeTotal:            2,
+			ProbeSuccess:          1,
+			ProbeErrors:           1,
+			ProbeErrorRate:        0.5,
+			P95TTFTMS:             &ttft,
+		},
+		2,
+	)
+	if decision.Action != "keep" {
+		t.Fatalf("decision = %+v, want keep because degraded formula must not increase weight", decision)
+	}
+}
+
+// TestProbeHealthyAdjustmentIsStepLimited 验证主动测速健康调权会被单轮步长限制。
+func TestProbeHealthyAdjustmentIsStepLimited(t *testing.T) {
+	cfg, err := NormalizeConfig(Config{
+		Probe:           ProbeConfig{Enabled: true, Model: "gpt-5.5", Samples: 2},
+		MinimumAttempts: 1,
+		Pools: []PoolConfig{
+			{
+				ID:         "pool_a",
+				VirtualKey: "vk_a",
+				Providers: []ProviderConfig{
+					{Name: "fast_provider", CostWeight: 1},
+					{Name: "slow_provider", CostWeight: 1},
+				},
+				Rules: &PoolRules{
+					MinProbeSamples: 2,
+					TTFTPriority:    0.75,
+					MinWeightChange: 0.01,
+					MaxWeightStep:   0.2,
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NormalizeConfig returned error: %v", err)
+	}
+
+	fastTTFT := 1000.0
+	slowTTFT := 5000.0
+	metrics := MergeProbeMetrics(
+		[]ProviderMetric{
+			{PoolID: "pool_a", Provider: "fast_provider", Total: 10, Success: 10, SuccessRate: 1},
+			{PoolID: "pool_a", Provider: "slow_provider", Total: 10, Success: 10, SuccessRate: 1},
+		},
+		[]ProbeMetric{
+			{PoolID: "pool_a", Provider: "fast_provider", Total: 2, Success: 2, P95TTFTMS: &fastTTFT},
+			{PoolID: "pool_a", Provider: "slow_provider", Total: 2, Success: 2, P95TTFTMS: &slowTTFT},
+		},
+	)
+	decisions := NewDecisionService(cfg).Decide(
+		[]PoolProviderState{
+			{PoolID: "pool_a", VirtualKey: "vk_a", Provider: "fast_provider", CurrentWeight: 0.35, CurrentInBifrost: true},
+			{PoolID: "pool_a", VirtualKey: "vk_a", Provider: "slow_provider", CurrentWeight: 1, CurrentInBifrost: true},
+		},
+		metrics,
+		false,
+	)
+
+	var fast Decision
+	for _, decision := range decisions {
+		if decision.Provider == "fast_provider" {
+			fast = decision
+		}
+	}
+	if fast.Action != "set_weight" || fast.TargetWeight != 0.55 {
+		t.Fatalf("fast decision = %+v, want step-limited target 0.55", fast)
 	}
 }
 
@@ -357,6 +546,39 @@ func TestMissingProviderDoesNotDropBelowMinActiveProviders(t *testing.T) {
 	}
 	if !foundProtectedMissing {
 		t.Fatalf("decisions = %+v, want missing provider kept at min weight", decisions)
+	}
+}
+
+// TestMissingProviderProtectionDoesNotIncreaseWeight 验证配置漂移保护也不能反向增权。
+//
+// 如果 Bifrost 里多出来的 provider 当前已经低于 min_weight，
+// 调度器不能为了“保留最少活跃 provider”把它从 0.02 提到 0.05。
+func TestMissingProviderProtectionDoesNotIncreaseWeight(t *testing.T) {
+	cfg, err := NormalizeConfig(Config{
+		Pools: []PoolConfig{
+			{
+				ID:                 "pool_a",
+				VirtualKey:         "vk_a",
+				MinActiveProviders: 1,
+				Providers:          []ProviderConfig{{Name: "provider_a", CostWeight: 0.7}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NormalizeConfig returned error: %v", err)
+	}
+
+	decisions := NewDecisionService(cfg).Decide(
+		[]PoolProviderState{
+			{PoolID: "pool_a", VirtualKey: "vk_a", Provider: "provider_b", CurrentWeight: 0.02, CurrentInBifrost: true},
+		},
+		[]ProviderMetric{{PoolID: "pool_a", Provider: "provider_b"}},
+		false,
+	)
+	for _, decision := range decisions {
+		if decision.Provider == "provider_b" && decision.TargetWeight > decision.CurrentWeight {
+			t.Fatalf("decision = %+v, want no increase for missing provider already below min weight", decision)
+		}
 	}
 }
 
