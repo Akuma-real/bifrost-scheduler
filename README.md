@@ -95,6 +95,7 @@ services:
       - .env
     volumes:
       - ./config.json:/app/config.json:ro
+      - ./logs:/app/logs
     command:
       - daemon
       - --config
@@ -102,8 +103,15 @@ services:
       - --interval
       - 5m
     read_only: true
+    tmpfs:
+      - /tmp
     security_opt:
       - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "2m"
+        max-file: "3"
 ```
 
 受限写入模式必须同时满足两个条件：
@@ -113,6 +121,17 @@ services:
 # 2. 命令显式加 --apply
 ./bifrost-scheduler plan --apply
 ```
+
+生产日志建议写到轮转文件，避免容器 stdout 过大：
+
+```env
+BIFROST_SCHEDULER_LOG_FILE=/app/logs/scheduler.log
+BIFROST_SCHEDULER_LOG_MAX_SIZE=10MB
+BIFROST_SCHEDULER_LOG_MAX_BACKUPS=5
+BIFROST_SCHEDULER_LOG_STDOUT=false
+```
+
+这样调度报告写入 `./logs/scheduler.log`，单文件到 10MB 自动轮转，最多保留 5 个备份；Docker 自身日志由 compose 的 `max-size/max-file` 限制。
 
 也可以用命令行覆盖 API 地址：
 

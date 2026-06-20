@@ -6,12 +6,22 @@ services:
       - .env
     volumes:
       - ./config.json:/app/config.json:ro
+      - ./logs:/app/logs
     command:
       - daemon
       - --config
       - /app/config.json
       - --interval
       - 5m
+      # Add --apply only when config.json mode is guarded_write.
+      # - --apply
     read_only: true
+    tmpfs:
+      - /tmp
     security_opt:
       - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "2m"
+        max-file: "3"

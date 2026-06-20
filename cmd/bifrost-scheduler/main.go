@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -51,12 +52,16 @@ func run() int {
 }
 
 type options struct {
-	ConfigPath  string
-	APIURL      string
-	APIUsername string
-	APIPassword string
-	APITimeout  time.Duration
-	Format      string
+	ConfigPath    string
+	APIURL        string
+	APIUsername   string
+	APIPassword   string
+	APITimeout    time.Duration
+	Format        string
+	LogFile       string
+	LogMaxSize    string
+	LogMaxBackups int
+	LogStdout     bool
 }
 
 func commonFlags(fs *flag.FlagSet) *options {
@@ -67,16 +72,27 @@ func commonFlags(fs *flag.FlagSet) *options {
 	fs.StringVar(&opts.APIPassword, "api-password", os.Getenv("BIFROST_API_PASSWORD"), "Bifrost dashboard/admin password")
 	fs.DurationVar(&opts.APITimeout, "api-timeout", envDuration("BIFROST_API_TIMEOUT", 30*time.Second), "Bifrost API request timeout")
 	fs.StringVar(&opts.Format, "format", envDefault("BIFROST_SCHEDULER_FORMAT", "markdown"), "output format: markdown or json")
+	fs.StringVar(&opts.LogFile, "log-file", os.Getenv("BIFROST_SCHEDULER_LOG_FILE"), "rotating log file path; empty writes to stdout/stderr only")
+	fs.StringVar(&opts.LogMaxSize, "log-max-size", envDefault("BIFROST_SCHEDULER_LOG_MAX_SIZE", "10MB"), "maximum size of one log file before rotation")
+	fs.IntVar(&opts.LogMaxBackups, "log-max-backups", envInt("BIFROST_SCHEDULER_LOG_MAX_BACKUPS", 5), "number of rotated log files to keep")
+	fs.BoolVar(&opts.LogStdout, "log-stdout", envBool("BIFROST_SCHEDULER_LOG_STDOUT", true), "also write output to stdout/stderr when log-file is set")
 	return opts
 }
 
 func runPlan(ctx context.Context, logger *slog.Logger, opts options, apply bool) int {
+	logger, output, closeLogs, err := setupLogging(opts)
+	if err != nil {
+		logger.Error("setup logging failed", "error", err)
+		return 1
+	}
+	defer closeLogs()
+
 	plan, err := buildPlan(ctx, opts, apply)
 	if err != nil {
 		logger.Error("plan failed", "error", err)
 		return 1
 	}
-	if err := scheduler.WritePlan(os.Stdout, plan, opts.Format); err != nil {
+	if err := scheduler.WritePlan(output, plan, opts.Format); err != nil {
 		logger.Error("write plan failed", "error", err)
 		return 1
 	}
@@ -87,6 +103,13 @@ func runPlan(ctx context.Context, logger *slog.Logger, opts options, apply bool)
 }
 
 func runDaemon(ctx context.Context, logger *slog.Logger, opts options, interval time.Duration, apply bool) int {
+	logger, output, closeLogs, err := setupLogging(opts)
+	if err != nil {
+		logger.Error("setup logging failed", "error", err)
+		return 1
+	}
+	defer closeLogs()
+
 	if interval <= 0 {
 		logger.Error("interval must be positive", "interval", interval.String())
 		return 2
@@ -98,7 +121,7 @@ func runDaemon(ctx context.Context, logger *slog.Logger, opts options, interval 
 		plan, err := buildPlan(ctx, opts, apply)
 		if err != nil {
 			logger.Error("plan failed", "error", err)
-		} else if err := scheduler.WritePlan(os.Stdout, plan, opts.Format); err != nil {
+		} else if err := scheduler.WritePlan(output, plan, opts.Format); err != nil {
 			logger.Error("write plan failed", "error", err)
 		}
 
@@ -109,6 +132,33 @@ func runDaemon(ctx context.Context, logger *slog.Logger, opts options, interval 
 		case <-ticker.C:
 		}
 	}
+}
+
+func setupLogging(opts options) (*slog.Logger, io.Writer, func(), error) {
+	if opts.LogFile == "" {
+		return slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})), os.Stdout, func() {}, nil
+	}
+
+	maxBytes, err := parseByteSize(opts.LogMaxSize)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	logFile, err := newRotatingFile(opts.LogFile, maxBytes, opts.LogMaxBackups)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	closeFn := func() {
+		_ = logFile.Close()
+	}
+
+	var output io.Writer = logFile
+	var loggerOutput io.Writer = logFile
+	if opts.LogStdout {
+		output = io.MultiWriter(os.Stdout, logFile)
+		loggerOutput = io.MultiWriter(os.Stderr, logFile)
+	}
+
+	return slog.New(slog.NewJSONHandler(loggerOutput, &slog.HandlerOptions{Level: slog.LevelInfo})), output, closeFn, nil
 }
 
 func buildPlan(ctx context.Context, opts options, apply bool) (scheduler.Plan, error) {
@@ -175,4 +225,31 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return parsed
+}
+
+func envInt(key string, fallback int) int {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := parsePositiveInt(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func envBool(key string, fallback bool) bool {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+	switch value {
+	case "1", "true", "TRUE", "yes", "YES", "on", "ON":
+		return true
+	case "0", "false", "FALSE", "no", "NO", "off", "OFF":
+		return false
+	default:
+		return fallback
+	}
 }
