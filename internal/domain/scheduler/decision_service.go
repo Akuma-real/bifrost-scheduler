@@ -1,95 +1,73 @@
+// package scheduler 表示这个文件属于“领域层调度器”这个包。
+//
+// 领域层只放业务判断：根据配置、当前状态、最近指标，决定要不要调权重。
 package scheduler
 
+// import 表示这个文件要用哪些包。
+//
+// fmt 用来拼接错误/原因文字，math 用来做浮点数计算，sort 用来排序决策。
 import (
-	"context"
 	"fmt"
 	"math"
 	"sort"
-	"time"
 )
 
-type Planner struct {
-	cfg  RuntimeConfig
-	repo Store
-	now  time.Time
+// DecisionService 是领域层的规则服务。
+//
+// service 在这里可以理解成“专门做一类判断的对象”。
+// 它只保存 RuntimeConfig，因为所有判断都必须依据配置里的阈值。
+type DecisionService struct {
+	cfg RuntimeConfig
 }
 
-type Store interface {
-	LoadProviderStates(ctx context.Context, pools []PoolConfig) ([]PoolProviderState, error)
-	LoadMetrics(ctx context.Context, pools []PoolConfig, windowStart, windowEnd time.Time, windowDuration time.Duration) ([]ProviderMetric, error)
-	SetProviderWeight(ctx context.Context, state PoolProviderState, weight float64) error
-	SetProviderKeysEnabled(ctx context.Context, state PoolProviderState, enabled bool) error
+// NewDecisionService 创建一个“懂调度规则”的对象。
+//
+// Domain 可以先理解成“业务规则”。
+// 这个对象不会调用 Bifrost，不会读文件，也不会打印输出。
+// 它只回答一个问题：根据配置、状态和指标，我们应该做什么决策？
+func NewDecisionService(cfg RuntimeConfig) DecisionService {
+	// 这里返回的是值，不是指针。
+	// 因为 DecisionService 里面只有配置，不需要在方法里修改自己。
+	return DecisionService{cfg: cfg}
 }
 
-func NewPlanner(cfg RuntimeConfig, repo Store, now time.Time) Planner {
-	if now.IsZero() {
-		now = time.Now()
-	}
-	return Planner{cfg: cfg, repo: repo, now: now}
-}
-
-func (p Planner) BuildPlan(ctx context.Context, apply bool) (Plan, error) {
-	windowStart := p.now.Add(-p.cfg.WindowDuration * time.Duration(p.cfg.QualityWindows))
-	windowLength := p.cfg.WindowDuration * time.Duration(p.cfg.QualityWindows)
-	states, err := p.repo.LoadProviderStates(ctx, p.cfg.Pools)
-	if err != nil {
-		return Plan{}, err
-	}
-	metrics, err := p.repo.LoadMetrics(ctx, p.cfg.Pools, windowStart, p.now, p.cfg.WindowDuration)
-	if err != nil {
-		return Plan{}, err
-	}
-	metrics = p.annotateBadWindows(metrics)
-
-	plan := Plan{
-		GeneratedAt:   p.now,
-		WindowStart:   windowStart,
-		Window:        windowLength.String(),
-		Mode:          p.cfg.Mode,
-		ApplyEnabled:  apply && p.cfg.Mode == "guarded_write",
-		Pools:         poolSnapshots(p.cfg.Pools),
-		Metrics:       metrics,
-		CurrentStates: states,
-	}
-	plan.Decisions = p.decide(states, metrics, plan.ApplyEnabled)
-
-	if apply {
-		if p.cfg.Mode != "guarded_write" {
-			for i := range plan.Decisions {
-				plan.Decisions[i].Apply = &ApplyResult{
-					Applied: false,
-					Message: "apply requested but config mode is not guarded_write",
-				}
-			}
-			return plan, nil
-		}
-		for i := range plan.Decisions {
-			result := p.applyDecision(ctx, plan.Decisions[i], states)
-			plan.Decisions[i].Apply = &result
-		}
-	}
-
-	return plan, nil
-}
-
-func (p Planner) annotateBadWindows(metrics []ProviderMetric) []ProviderMetric {
+// AnnotateWindows 给每个 provider 的小时间窗口打标记：坏窗口或慢窗口。
+//
+// 为什么需要它：
+// 单个 15 分钟窗口里的异常不应该立刻禁用 provider。
+// 所以我们会看多个小窗口，并统计“连续坏了几次”或“连续慢了几次”，再做更强的决策。
+func (s DecisionService) AnnotateWindows(metrics []ProviderMetric) []ProviderMetric {
+	// make([]ProviderMetric, 0, len(metrics)) 创建一个空切片。
+	// 容量预先设成 len(metrics)，避免 append 时频繁扩容。
 	out := make([]ProviderMetric, 0, len(metrics))
 	for _, metric := range metrics {
-		pool, ok := p.pool(metric.PoolID)
+		// 先根据 metric.PoolID 找到对应 pool 配置。
+		pool, ok := s.pool(metric.PoolID)
+		// 找不到 pool，或者没有小窗口，就原样保留。
 		if !ok || len(metric.Windows) == 0 {
 			out = append(out, metric)
 			continue
 		}
+		// EffectiveRules 返回这个 pool 最终使用的规则。
 		rules := pool.EffectiveRules()
+
+		// badWindows 是总坏窗口数量。
+		// consecutive 是当前连续坏窗口计数。
+		// maxConsecutive 是最大连续坏窗口计数。
 		badWindows := 0
 		consecutive := 0
 		maxConsecutive := 0
+
+		// slowWindows / slowConsecutive / maxSlowConsecutive 同理，只是用于慢窗口。
 		slowWindows := 0
 		slowConsecutive := 0
 		maxSlowConsecutive := 0
+
+		// 用下标遍历，才能拿到 &metric.Windows[i] 并修改这个窗口。
 		for i := range metric.Windows {
 			window := &metric.Windows[i]
-			window.Bad = badWindow(*window, rules, p.cfg.MinimumAttempts)
+			// badWindow 是纯函数：输入窗口和规则，返回 true/false。
+			window.Bad = badWindow(*window, rules, s.cfg.MinimumAttempts)
 			if window.Bad {
 				badWindows++
 				consecutive++
@@ -97,9 +75,11 @@ func (p Planner) annotateBadWindows(metrics []ProviderMetric) []ProviderMetric {
 					maxConsecutive = consecutive
 				}
 			} else {
+				// 一旦遇到非坏窗口，连续计数归零。
 				consecutive = 0
 			}
 
+			// 慢窗口单独统计，因为错误和慢不是一回事。
 			window.Slow = slowWindow(*window, rules)
 			if window.Slow {
 				slowWindows++
@@ -111,6 +91,7 @@ func (p Planner) annotateBadWindows(metrics []ProviderMetric) []ProviderMetric {
 				slowConsecutive = 0
 			}
 		}
+		// 把统计结果写回 metric，报告和决策都会用到。
 		metric.BadWindows = badWindows
 		metric.ConsecutiveBadWindows = maxConsecutive
 		metric.SlowWindows = slowWindows
@@ -120,51 +101,74 @@ func (p Planner) annotateBadWindows(metrics []ProviderMetric) []ProviderMetric {
 	return out
 }
 
-func (p Planner) pool(poolID string) (PoolConfig, bool) {
-	for _, pool := range p.cfg.Pools {
-		if pool.ID == poolID {
-			return pool, true
-		}
-	}
-	return PoolConfig{}, false
-}
-
-func (p Planner) decide(states []PoolProviderState, metrics []ProviderMetric, applyEnabled bool) []Decision {
+// Decide 比较三类东西，然后返回决策列表：
+//   - 配置里写了哪些 provider。
+//   - Bifrost 当前实际有哪些 provider 和权重。
+//   - 最近日志统计出来的健康指标。
+//
+// 读这个函数时分三段看：
+//  1. 先建立 map，方便快速找到某个 provider 的状态和指标。
+//  2. 对配置里的每个 provider，调用 DecideProvider 判断。
+//  3. 对“Bifrost 里有，但配置里没有”的 provider，建议人工检查或清零，
+//     同时保护 min_active_providers，避免把池子清空。
+func (s DecisionService) Decide(states []PoolProviderState, metrics []ProviderMetric, applyEnabled bool) []Decision {
+	// 先把 states 列表转成 map，后面用 pool+provider 可以 O(1) 快速查找。
 	statesByPoolProvider := map[string]PoolProviderState{}
 	for _, state := range states {
 		statesByPoolProvider[key(state.PoolID, state.Provider)] = state
 	}
+	// metrics 也同样转成 map。
 	metricsByPoolProvider := map[string]ProviderMetric{}
 	for _, metric := range metrics {
 		metricsByPoolProvider[key(metric.PoolID, metric.Provider)] = metric
 	}
 
+	// var decisions []Decision 声明一个 Decision 切片。
+	// 初始值是 nil，但可以直接 append。
 	var decisions []Decision
-	for _, pool := range p.cfg.Pools {
+
+	// 按配置里的 pool 逐个处理。
+	for _, pool := range s.cfg.Pools {
+		// activeNow 是当前 Bifrost 里这个 pool 有多少 provider 权重大于 0。
 		activeNow := activeProviderCount(pool.ID, statesByPoolProvider)
+		// projectedActive 是“如果按前面的决策执行后，预计还剩几个活跃 provider”。
+		// 它用来防止连续几个清零动作把整个池子清空。
 		projectedActive := activeNow
 		for _, providerCfg := range pool.Providers {
+			// 从 map 里取状态和指标。
+			// 如果不存在，Go 会返回结构体零值。
 			state := statesByPoolProvider[key(pool.ID, providerCfg.Name)]
 			metric := metricsByPoolProvider[key(pool.ID, providerCfg.Name)]
-			decision := p.decideProvider(pool, providerCfg, state, metric, projectedActive)
+
+			// 单个 provider 的判断交给 DecideProvider。
+			decision := s.DecideProvider(pool, providerCfg, state, metric, projectedActive)
 			decision.DryRun = !applyEnabled
-			if decisionNoops(decision) {
+			// 没有实际动作的决策不放进报告，避免报告噪音太大。
+			if DecisionNoop(decision) {
 				continue
 			}
+			// 根据这个决策更新 projectedActive，供后续 provider 判断使用。
 			projectedActive = projectedActiveProviderCount(projectedActive, state, decision)
 			decisions = append(decisions, decision)
 		}
+
+		// 第二段：处理 Bifrost 里存在、但配置文件没写的 provider。
+		// 这通常代表线上和配置漂移了，需要报告出来。
 		for _, state := range states {
 			if state.PoolID != pool.ID {
 				continue
 			}
-			if _, ok := p.cfg.Provider(pool.ID, state.Provider); ok {
+			// 如果配置里能找到这个 provider，说明前面已经处理过。
+			if _, ok := s.cfg.Provider(pool.ID, state.Provider); ok {
 				continue
 			}
 			metric := metricsByPoolProvider[key(pool.ID, state.Provider)]
+
+			// 默认策略：配置没有的 provider 应该被清零。
 			targetWeight := 0.0
 			action := "set_weight_zero"
 			reason := "provider is present in Bifrost VK but missing from scheduler config"
+			// 但如果这是最后一个活跃 provider，就只降到最小权重，避免池子不可用。
 			if projectedActive <= pool.MinActiveProviders && state.CurrentWeight > 0 {
 				targetWeight = pool.EffectiveRules().MinWeight
 				action = "set_weight"
@@ -180,9 +184,9 @@ func (p Planner) decide(states []PoolProviderState, metrics []ProviderMetric, ap
 				Severity:      "warning",
 				Reason:        reason,
 				DryRun:        !applyEnabled,
-				Inputs:        decisionInputs(metric),
+				Inputs:        DecisionInputsFromMetric(metric),
 			}
-			if decisionNoops(decision) {
+			if DecisionNoop(decision) {
 				continue
 			}
 			decisions = append(decisions, decision)
@@ -190,6 +194,7 @@ func (p Planner) decide(states []PoolProviderState, metrics []ProviderMetric, ap
 		}
 	}
 
+	// 排序让报告稳定：严重级别高的在前，同级别再按 pool/provider 名称排序。
 	sort.Slice(decisions, func(i, j int) bool {
 		if decisions[i].Severity != decisions[j].Severity {
 			return severityRank(decisions[i].Severity) > severityRank(decisions[j].Severity)
@@ -202,18 +207,41 @@ func (p Planner) decide(states []PoolProviderState, metrics []ProviderMetric, ap
 	return decisions
 }
 
-func (p Planner) decideProvider(pool PoolConfig, provider ProviderConfig, state PoolProviderState, metric ProviderMetric, activeNow int) Decision {
+// DecideProvider 是单个 provider 的核心健康判断规则。
+//
+// 这个函数是“纯判断”：只读取输入，返回一个 Decision。
+// 它不会修改 Bifrost。
+//
+// 判断顺序从“强安全保护”到“正常恢复”：
+//  1. Bifrost 里缺失：需要人工检查。
+//  2. 配置不允许或 quarantine：权重清零。
+//  3. 流量太少：只给 min_weight 探测。
+//  4. 连续关键错误/坏窗口：禁用或清零。
+//  5. 错误、超时、延迟告警：降低权重。
+//  6. 恢复健康：恢复到配置里的 cost_weight。
+func (s DecisionService) DecideProvider(pool PoolConfig, provider ProviderConfig, state PoolProviderState, metric ProviderMetric, activeNow int) Decision {
+	// 取出这个 pool 的最终规则。
 	rules := pool.EffectiveRules()
+
+	// currentWeight 是 Bifrost 当前权重。
 	currentWeight := state.CurrentWeight
+
+	// targetWeight 是健康时应该恢复到的目标权重。
+	// 配置没写 cost_weight 时，用默认成本权重。
 	targetWeight := provider.CostWeight
 	if targetWeight <= 0 {
 		targetWeight = rules.DefaultCostWeight
 	}
+
+	// minWeight 是探测权重。
+	// provider 没单独写时，用 pool 规则里的默认值。
 	minWeight := provider.MinWeight
 	if minWeight == 0 {
 		minWeight = rules.MinWeight
 	}
 
+	// base 是默认决策：保持不变。
+	// 后面的每个分支只在需要动作时修改 base 并 return。
 	base := Decision{
 		PoolID:        pool.ID,
 		VirtualKey:    pool.VirtualKey,
@@ -222,9 +250,11 @@ func (p Planner) decideProvider(pool PoolConfig, provider ProviderConfig, state 
 		CurrentWeight: currentWeight,
 		TargetWeight:  currentWeight,
 		Severity:      "info",
-		Inputs:        decisionInputs(metric),
+		Inputs:        DecisionInputsFromMetric(metric),
 	}
 
+	// 配置里有，但 Bifrost VK 里找不到这个 provider。
+	// 调度器不自动创建 provider config，只提醒人工检查。
 	if !state.CurrentInBifrost {
 		base.Action = "review_missing_provider"
 		base.TargetWeight = targetWeight
@@ -233,7 +263,9 @@ func (p Planner) decideProvider(pool PoolConfig, provider ProviderConfig, state 
 		return base
 	}
 
+	// quarantine 或 allowed=false：这个 provider 不应该在池子里有流量。
 	if !provider.AllowedInPool() {
+		// 当前已经是 0，就不用生成动作。
 		if currentWeight == 0 {
 			return base
 		}
@@ -244,7 +276,9 @@ func (p Planner) decideProvider(pool PoolConfig, provider ProviderConfig, state 
 		return base
 	}
 
-	if metric.Total < p.cfg.MinimumAttempts {
+	// 样本太少时不做强判断，避免误判。
+	if metric.Total < s.cfg.MinimumAttempts {
+		// 但如果权重已经为 0，仍然持续看到关键错误，就尝试继续禁用 key。
 		if currentWeight == 0 && metric.CriticalErrors >= rules.CriticalErrorThreshold {
 			base.Action = "disable_provider_keys"
 			base.TargetWeight = 0
@@ -252,6 +286,7 @@ func (p Planner) decideProvider(pool PoolConfig, provider ProviderConfig, state 
 			base.Reason = "provider already has zero weight, but critical errors remain; retry disabling bound keys"
 			return base
 		}
+		// 如果没有流量且权重为 0，给它一点点探测权重，让系统能重新收集证据。
 		if currentWeight == 0 && targetWeight > 0 {
 			base.Action = "set_weight"
 			base.TargetWeight = minWeight
@@ -262,9 +297,12 @@ func (p Planner) decideProvider(pool PoolConfig, provider ProviderConfig, state 
 		return base
 	}
 
+	// 关键错误 + 高错误率 + 连续坏窗口都满足时，才执行强禁用。
+	// 这样可以避免一次短暂异常直接把 provider 永久打下去。
 	if metric.CriticalErrors >= rules.CriticalErrorThreshold &&
 		metric.ErrorRate >= rules.DisableErrorRate &&
 		metric.ConsecutiveBadWindows >= rules.RequiredBadWindows {
+		// 安全底线：不能把最后一个活跃 provider 直接禁掉。
 		if activeNow <= pool.MinActiveProviders && currentWeight > 0 {
 			base.Action = "set_weight"
 			base.TargetWeight = minWeight
@@ -279,6 +317,8 @@ func (p Planner) decideProvider(pool PoolConfig, provider ProviderConfig, state 
 		return base
 	}
 
+	// 关键错误已经出现，但连续坏窗口还不够。
+	// 这时先降到探测权重，不直接禁用。
 	if metric.CriticalErrors >= rules.CriticalErrorThreshold &&
 		metric.ErrorRate >= rules.DisableErrorRate &&
 		metric.BadWindows > 0 {
@@ -289,6 +329,7 @@ func (p Planner) decideProvider(pool PoolConfig, provider ProviderConfig, state 
 		return base
 	}
 
+	// 普通错误率达到禁用阈值，并且已经连续坏了足够窗口。
 	if metric.Errors >= rules.MinErrors && metric.ErrorRate >= rules.DisableErrorRate && metric.ConsecutiveBadWindows >= rules.RequiredBadWindows {
 		if activeNow <= pool.MinActiveProviders && currentWeight > 0 {
 			base.Action = "set_weight"
@@ -304,6 +345,7 @@ func (p Planner) decideProvider(pool PoolConfig, provider ProviderConfig, state 
 		return base
 	}
 
+	// 普通错误率已经很高，但连续窗口证据还不够，先降到探测权重。
 	if metric.Errors >= rules.MinErrors && metric.ErrorRate >= rules.DisableErrorRate && metric.BadWindows > 0 {
 		base.Action = "set_weight"
 		base.TargetWeight = minWeight
@@ -312,6 +354,7 @@ func (p Planner) decideProvider(pool PoolConfig, provider ProviderConfig, state 
 		return base
 	}
 
+	// timeout / stream idle 太多，也先降到探测权重。
 	if rules.MaxTimeoutOrIdle > 0 && metric.TimeoutOrStreamIdle > rules.MaxTimeoutOrIdle && metric.Errors >= rules.MinErrors && metric.BadWindows > 0 {
 		base.Action = "set_weight"
 		base.TargetWeight = minWeight
@@ -320,26 +363,29 @@ func (p Planner) decideProvider(pool PoolConfig, provider ProviderConfig, state 
 		return base
 	}
 
+	// 错误率超过普通阈值，但没到禁用阈值，就按错误率比例降权。
 	if metric.Errors >= rules.MinErrors && metric.ErrorRate > rules.MaxErrorRate && metric.BadWindows > 0 {
 		base.Action = "set_weight"
-		base.TargetWeight = clampWeight(targetWeight*(1-metric.ErrorRate), minWeight, targetWeight)
+		base.TargetWeight = ClampWeight(targetWeight*(1-metric.ErrorRate), minWeight, targetWeight)
 		base.Severity = "warning"
 		base.Reason = fmt.Sprintf("error rate %.2f%% exceeded %.2f%%", metric.ErrorRate*100, rules.MaxErrorRate*100)
 		return base
 	}
 
+	// 延迟过高也可以降权，但需要成功样本够多，并且连续慢窗口够多。
 	if metric.P95LatencyMS != nil &&
 		rules.MaxP95LatencyMS > 0 &&
 		metric.Success >= rules.MinLatencySamples &&
 		*metric.P95LatencyMS > rules.MaxP95LatencyMS &&
 		metric.ConsecutiveSlowWindows >= rules.RequiredBadWindows {
 		base.Action = "set_weight"
-		base.TargetWeight = clampWeight(targetWeight*0.5, minWeight, targetWeight)
+		base.TargetWeight = ClampWeight(targetWeight*0.5, minWeight, targetWeight)
 		base.Severity = "warning"
 		base.Reason = fmt.Sprintf("p95 latency %.0fms exceeded %.0fms across %d consecutive slow windows", *metric.P95LatencyMS, rules.MaxP95LatencyMS, metric.ConsecutiveSlowWindows)
 		return base
 	}
 
+	// 当前权重为 0，但最近成功率已经达标，就用最小权重重新放一点流量。
 	if currentWeight == 0 && metric.SuccessRate >= rules.MinSuccessRateForRecovery {
 		base.Action = "set_weight"
 		base.TargetWeight = minWeight
@@ -348,6 +394,7 @@ func (p Planner) decideProvider(pool PoolConfig, provider ProviderConfig, state 
 		return base
 	}
 
+	// 当前权重不是目标权重，并且 provider 健康，就恢复到 cost_weight。
 	if currentWeight > 0 && math.Abs(currentWeight-targetWeight) > 0.001 && metric.SuccessRate >= rules.MinSuccessRateForRecovery {
 		base.Action = "set_weight"
 		base.TargetWeight = targetWeight
@@ -359,6 +406,19 @@ func (p Planner) decideProvider(pool PoolConfig, provider ProviderConfig, state 
 	return base
 }
 
+// pool 根据 poolID 查找 pool 配置。
+func (s DecisionService) pool(poolID string) (PoolConfig, bool) {
+	for _, pool := range s.cfg.Pools {
+		if pool.ID == poolID {
+			return pool, true
+		}
+	}
+	return PoolConfig{}, false
+}
+
+// badWindow 判断一个小窗口是否算“坏窗口”。
+//
+// 只有样本数足够时才判断，避免 1 个失败请求就把窗口打坏。
 func badWindow(window WindowMetric, rules PoolRules, minimumAttempts int) bool {
 	if window.Total < minimumAttempts {
 		return false
@@ -375,61 +435,32 @@ func badWindow(window WindowMetric, rules PoolRules, minimumAttempts int) bool {
 	return false
 }
 
+// slowWindow 判断一个小窗口是否算“慢窗口”。
 func slowWindow(window WindowMetric, rules PoolRules) bool {
+	// 没配置 MaxP95LatencyMS，或者窗口没有 P95，就不判断慢。
 	if rules.MaxP95LatencyMS <= 0 || window.P95LatencyMS == nil {
 		return false
 	}
 	return window.Success >= rules.MinLatencySamples && *window.P95LatencyMS > rules.MaxP95LatencyMS
 }
 
-func (p Planner) applyDecision(ctx context.Context, decision Decision, states []PoolProviderState) ApplyResult {
-	state, ok := stateFor(states, decision.PoolID, decision.Provider)
-	if !ok || !state.CurrentInBifrost {
-		return ApplyResult{Applied: false, Message: "provider config not found in Bifrost"}
-	}
-
-	switch decision.Action {
-	case "set_weight", "set_weight_zero":
-		if weightsEqual(state.CurrentWeight, decision.TargetWeight) {
-			return ApplyResult{Skipped: true, Message: "provider weight already matches target"}
-		}
-		if err := p.repo.SetProviderWeight(ctx, state, decision.TargetWeight); err != nil {
-			return ApplyResult{Applied: false, Message: err.Error()}
-		}
-		return ApplyResult{Applied: true, Message: "provider weight updated"}
-	case "disable_provider_keys":
-		if err := p.repo.SetProviderKeysEnabled(ctx, state, false); err != nil {
-			return ApplyResult{Applied: false, Message: "key disable failed: " + err.Error()}
-		}
-		return ApplyResult{Applied: true, Message: "provider keys disabled"}
-	case "disable_provider":
-		if err := p.repo.SetProviderKeysEnabled(ctx, state, false); err != nil {
-			return ApplyResult{Applied: false, Message: "key disable failed before weight update: " + err.Error()}
-		}
-		if err := p.repo.SetProviderWeight(ctx, state, 0); err != nil {
-			return ApplyResult{Applied: false, Message: "keys disabled, but weight update failed: " + err.Error()}
-		}
-		return ApplyResult{Applied: true, Message: "provider weight set to zero and keys disabled"}
-	case "review_missing_provider":
-		return ApplyResult{Skipped: true, Message: "manual Bifrost provider-config creation is required"}
-	default:
-		return ApplyResult{Skipped: true, Message: "action is not applyable"}
-	}
-}
-
-func decisionNoops(decision Decision) bool {
+// DecisionNoop 判断一个决策是否等于“什么都不用做”。
+//
+// 返回 true 的决策不会出现在最终报告里。
+func DecisionNoop(decision Decision) bool {
 	if decision.Action == "keep" {
 		return true
 	}
 	switch decision.Action {
 	case "set_weight", "set_weight_zero":
-		return weightsEqual(decision.CurrentWeight, decision.TargetWeight)
+		return WeightsEqual(decision.CurrentWeight, decision.TargetWeight)
 	default:
 		return false
 	}
 }
 
-func poolSnapshots(pools []PoolConfig) []PoolSnapshot {
+// PoolSnapshots 把完整 pool 配置转换成报告里需要展示的简短信息。
+func PoolSnapshots(pools []PoolConfig) []PoolSnapshot {
 	out := make([]PoolSnapshot, 0, len(pools))
 	for _, pool := range pools {
 		out = append(out, PoolSnapshot{ID: pool.ID, VirtualKey: pool.VirtualKey, Kind: pool.Kind})
@@ -437,6 +468,7 @@ func poolSnapshots(pools []PoolConfig) []PoolSnapshot {
 	return out
 }
 
+// activeProviderCount 统计某个 pool 当前有多少 provider 权重大于 0。
 func activeProviderCount(poolID string, states map[string]PoolProviderState) int {
 	count := 0
 	for _, state := range states {
@@ -447,7 +479,11 @@ func activeProviderCount(poolID string, states map[string]PoolProviderState) int
 	return count
 }
 
+// projectedActiveProviderCount 根据一个决策推算活跃 provider 数量会怎么变化。
+//
+// 这个函数不写 Bifrost，只是在内存里做预测。
 func projectedActiveProviderCount(current int, state PoolProviderState, decision Decision) int {
+	// 只有这些动作会影响活跃 provider 数。
 	switch decision.Action {
 	case "set_weight", "set_weight_zero", "disable_provider":
 	default:
@@ -456,16 +492,19 @@ func projectedActiveProviderCount(current int, state PoolProviderState, decision
 	if !state.CurrentInBifrost {
 		return current
 	}
+	// 原来大于 0，目标小于等于 0，活跃数减少。
 	if state.CurrentWeight > 0 && decision.TargetWeight <= 0 {
 		return current - 1
 	}
+	// 原来小于等于 0，目标大于 0，活跃数增加。
 	if state.CurrentWeight <= 0 && decision.TargetWeight > 0 {
 		return current + 1
 	}
 	return current
 }
 
-func stateFor(states []PoolProviderState, poolID, provider string) (PoolProviderState, bool) {
+// StateFor 从状态列表里找指定 pool/provider 的状态。
+func StateFor(states []PoolProviderState, poolID, provider string) (PoolProviderState, bool) {
 	for _, state := range states {
 		if state.PoolID == poolID && state.Provider == provider {
 			return state, true
@@ -474,11 +513,18 @@ func stateFor(states []PoolProviderState, poolID, provider string) (PoolProvider
 	return PoolProviderState{}, false
 }
 
+// key 把 poolID 和 provider 拼成 map 的 key。
+//
+// 中间用 "\x00" 是为了避免普通字符冲突。
+// 例如 pool="ab", provider="c" 和 pool="a", provider="bc" 不会混在一起。
 func key(poolID, provider string) string {
 	return poolID + "\x00" + provider
 }
 
-func decisionInputs(metric ProviderMetric) DecisionInputs {
+// DecisionInputsFromMetric 把 ProviderMetric 转成 DecisionInputs。
+//
+// ProviderMetric 是完整指标；DecisionInputs 是写入某个决策里的证据快照。
+func DecisionInputsFromMetric(metric ProviderMetric) DecisionInputs {
 	return DecisionInputs{
 		Total:                  metric.Total,
 		Success:                metric.Success,
@@ -499,7 +545,10 @@ func decisionInputs(metric ProviderMetric) DecisionInputs {
 	}
 }
 
-func clampWeight(value, min, max float64) float64 {
+// ClampWeight 把权重限制在 min 和 max 之间。
+//
+// 例如算出来是 0.001，但 min 是 0.05，就返回 0.05。
+func ClampWeight(value, min, max float64) float64 {
 	if max <= 0 {
 		max = 1
 	}
@@ -509,13 +558,18 @@ func clampWeight(value, min, max float64) float64 {
 	if value > max {
 		return max
 	}
+	// 保留 4 位小数，避免浮点数出现 0.30000000004 这种显示。
 	return math.Round(value*10000) / 10000
 }
 
-func weightsEqual(a, b float64) bool {
+// WeightsEqual 判断两个权重是否可以视为相等。
+//
+// 浮点数不能总是直接用 == 比较，所以这里允许 0.001 的误差。
+func WeightsEqual(a, b float64) bool {
 	return math.Abs(a-b) <= 0.001
 }
 
+// severityRank 把严重级别转成数字，方便排序。
 func severityRank(severity string) int {
 	switch severity {
 	case "critical":

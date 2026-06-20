@@ -4,6 +4,11 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      # 可选 Telegram 通知。真实值放在 .env 里。
+      # BIFROST_SCHEDULER_TG_BOT_TOKEN: ${BIFROST_SCHEDULER_TG_BOT_TOKEN:-}
+      # BIFROST_SCHEDULER_TG_CHAT_ID: ${BIFROST_SCHEDULER_TG_CHAT_ID:-}
+      # BIFROST_SCHEDULER_TG_THREAD_ID: ${BIFROST_SCHEDULER_TG_THREAD_ID:-}
     volumes:
       - ./config.json:/app/config.json:ro
       - ./logs:/app/logs

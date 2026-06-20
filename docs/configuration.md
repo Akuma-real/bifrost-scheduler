@@ -144,6 +144,33 @@ Bifrost API 路径已经内置，不需要写进 JSON：
 
 调度器启动后会先调用 `/api/session/login` 自动登录，后续请求自动使用返回的 token 或 session cookie。
 
+## Telegram 通知
+
+Telegram 通知不写进 JSON 配置，使用环境变量或命令行参数。这样 bot token 不会进入公开配置模板。
+
+| 名称 | 来源 | 必填 | 默认值 | 作用 |
+| --- | --- | --- | --- | --- |
+| `BIFROST_SCHEDULER_TG_BOT_TOKEN` / `--telegram-bot-token` | 环境变量或命令行 | 否 | 空 | Telegram BotFather 给你的 bot token。 |
+| `BIFROST_SCHEDULER_TG_CHAT_ID` / `--telegram-chat-id` | 环境变量或命令行 | 否 | 空 | 通知目标 chat id，可以是个人、群组或频道。 |
+| `BIFROST_SCHEDULER_TG_THREAD_ID` / `--telegram-thread-id` | 环境变量或命令行 | 否 | 空 | Telegram 群组话题 ID，也就是 `message_thread_id`。不用话题就不填。 |
+
+行为：
+
+- token 和 chat id 都为空：通知关闭。
+- 只填 token 或只填 chat id：认为配置错误，调度器会写错误日志，但不会停止调度。
+- 本轮没有 `decisions`：不发送通知。
+- `plan` 命令：只要本轮有 `decisions`，发送一次。
+- `daemon` 命令：只有变更指纹变化时才发送；同一批变更不会每个 interval 重复刷屏。
+- Telegram 发送失败：只写日志，不阻断 Bifrost 调度。
+
+`.env` 示例：
+
+```env
+BIFROST_SCHEDULER_TG_BOT_TOKEN=123456:bot-token-from-botfather
+BIFROST_SCHEDULER_TG_CHAT_ID=-1001234567890
+# BIFROST_SCHEDULER_TG_THREAD_ID=123
+```
+
 ## `pools[]`
 
 一个 pool 对应一个 Bifrost Virtual Key。
