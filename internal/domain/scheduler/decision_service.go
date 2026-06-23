@@ -338,7 +338,7 @@ func (s DecisionService) decideProvider(pool PoolConfig, provider ProviderConfig
 			return base
 		}
 		// 主动测速是调度器自己发出的流式请求。
-		// 即使真实业务日志少，只要主动测速样本足够，也可以先按首字证据做温和调权。
+		// 低业务流量时只用它处理明确异常，不按几次首字样本反复重排健康权重。
 		if decision, ok := s.probeDecision(base, rules, metric, currentWeight, targetWeight, minWeight, probeTarget, hasProbeTarget); ok {
 			return decision
 		}
@@ -524,7 +524,7 @@ func (s DecisionService) probeDecision(base Decision, rules PoolRules, metric Pr
 	// 主动测速失败率高，先降到最小探测权重。
 	if metric.ProbeTotal >= rules.MinProbeSamples &&
 		metric.ProbeErrors > 0 &&
-		metric.ProbeErrorRate >= rules.MaxErrorRate {
+		metric.ProbeErrorRate > rules.MaxErrorRate {
 		if currentWeight == 0 {
 			return Decision{}, false
 		}
@@ -538,7 +538,7 @@ func (s DecisionService) probeDecision(base Decision, rules PoolRules, metric Pr
 		base.Reason = fmt.Sprintf("active probe error rate %.2f%% exceeded %.2f%%", metric.ProbeErrorRate*100, rules.MaxErrorRate*100)
 		return base, true
 	}
-	// 首字优先：如果主动测速有足够样本，就按“首字速度 + 成本”计算目标权重。
+	// 首字优先：如果主动测速和真实业务样本都足够，就按“首字速度 + 成本”计算目标权重。
 	// 这不是用 Bifrost 日志 latency 冒充首字，而是用流式探测真正收到第一段响应的时间。
 	if metric.P95TTFTMS == nil || metric.ProbeSuccess < rules.MinProbeSamples {
 		return Decision{}, false
@@ -566,7 +566,7 @@ func (s DecisionService) probeDecision(base Decision, rules PoolRules, metric Pr
 		base.Reason = "active probe looks recovered; re-enter at minimum weight"
 		return base, true
 	}
-	if hasProbeTarget && math.Abs(currentWeight-probeTarget) >= rules.MinWeightChange {
+	if hasProbeTarget && metric.Total >= s.cfg.MinimumAttempts && math.Abs(currentWeight-probeTarget) >= rules.MinWeightChange {
 		target := steppedTargetWeight(currentWeight, probeTarget, rules.MaxWeightStep)
 		if WeightsEqual(currentWeight, target) {
 			return Decision{}, false
@@ -654,7 +654,7 @@ func (s DecisionService) hasDegradationEvidence(rules PoolRules, metric Provider
 	}
 	if metric.ProbeTotal >= rules.MinProbeSamples &&
 		metric.ProbeErrors > 0 &&
-		metric.ProbeErrorRate >= rules.MaxErrorRate {
+		metric.ProbeErrorRate > rules.MaxErrorRate {
 		return true
 	}
 	if metric.P95TTFTMS != nil &&
@@ -684,7 +684,7 @@ func (s DecisionService) probeAwareTargetWeights(metrics map[string]ProviderMetr
 
 		for _, provider := range pool.Providers {
 			metric, ok := metrics[key(pool.ID, provider.Name)]
-			if !ok || metric.P95TTFTMS == nil || metric.ProbeSuccess < rules.MinProbeSamples {
+			if !ok || metric.Total < s.cfg.MinimumAttempts || metric.P95TTFTMS == nil || metric.ProbeSuccess < rules.MinProbeSamples {
 				continue
 			}
 			ttft := *metric.P95TTFTMS

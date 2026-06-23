@@ -102,6 +102,73 @@ func TestCostWeightValidation(t *testing.T) {
 	}
 }
 
+// TestPriceRMBPerDaoValidation 验证 RMB/刀 价格不能是负数。
+func TestPriceRMBPerDaoValidation(t *testing.T) {
+	_, err := NormalizeConfig(Config{
+		Pools: []PoolConfig{
+			{
+				ID:         "gpt_low",
+				VirtualKey: "vk_low_text",
+				Providers:  []ProviderConfig{{Name: "provider_a", PriceRMBPerDao: -0.1}},
+			},
+		},
+	})
+	if err == nil {
+		t.Fatalf("NormalizeConfig returned nil error, want price validation error")
+	}
+}
+
+// TestPriceRMBPerDaoDerivesCostWeight 验证同池价格填全后，cost_weight 自动按最低价换算。
+func TestPriceRMBPerDaoDerivesCostWeight(t *testing.T) {
+	cfg, err := NormalizeConfig(Config{
+		Pools: []PoolConfig{
+			{
+				ID:         "gpt_low",
+				VirtualKey: "vk_low_text",
+				Providers: []ProviderConfig{
+					{Name: "cheap", PriceRMBPerDao: 0.045},
+					{Name: "expensive", PriceRMBPerDao: 0.055},
+					{Name: "quarantine", Role: "quarantine"},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NormalizeConfig returned error: %v", err)
+	}
+
+	providers := cfg.Pools[0].Providers
+	if providers[0].CostWeight != 1 {
+		t.Fatalf("cheap cost_weight = %.4f, want 1", providers[0].CostWeight)
+	}
+	if providers[1].CostWeight != 0.8182 {
+		t.Fatalf("expensive cost_weight = %.4f, want 0.8182", providers[1].CostWeight)
+	}
+}
+
+// TestPartialPriceRMBPerDaoKeepsManualCostWeight 验证价格没填全时，不自动覆盖手写 cost_weight。
+func TestPartialPriceRMBPerDaoKeepsManualCostWeight(t *testing.T) {
+	cfg, err := NormalizeConfig(Config{
+		Pools: []PoolConfig{
+			{
+				ID:         "gpt_low",
+				VirtualKey: "vk_low_text",
+				Providers: []ProviderConfig{
+					{Name: "provider_a", CostWeight: 0.7, PriceRMBPerDao: 0.045},
+					{Name: "provider_b", CostWeight: 0.4},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NormalizeConfig returned error: %v", err)
+	}
+
+	if cfg.Pools[0].Providers[0].CostWeight != 0.7 || cfg.Pools[0].Providers[1].CostWeight != 0.4 {
+		t.Fatalf("providers = %+v, want manual cost_weight preserved", cfg.Pools[0].Providers)
+	}
+}
+
 // TestDefaultCostWeight 验证 provider 没写 cost_weight 时，规则里默认目标权重是 1。
 func TestDefaultCostWeight(t *testing.T) {
 	cfg, err := NormalizeConfig(Config{
@@ -120,6 +187,30 @@ func TestDefaultCostWeight(t *testing.T) {
 	rules := cfg.Pools[0].EffectiveRules()
 	if rules.DefaultCostWeight != 1 {
 		t.Fatalf("default_cost_weight = %.2f, want 1", rules.DefaultCostWeight)
+	}
+}
+
+// TestDefaultProbeSamples 验证主动测速默认至少取 3 次，避免 1-2 次样本导致权重抖动。
+func TestDefaultProbeSamples(t *testing.T) {
+	cfg, err := NormalizeConfig(Config{
+		Probe: ProbeConfig{Enabled: true},
+		Pools: []PoolConfig{
+			{
+				ID:         "gpt_low",
+				VirtualKey: "vk_low_text",
+				Providers:  []ProviderConfig{{Name: "provider_a"}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NormalizeConfig returned error: %v", err)
+	}
+
+	if cfg.Probe.Samples != 3 {
+		t.Fatalf("probe.samples = %d, want 3", cfg.Probe.Samples)
+	}
+	if cfg.Pools[0].EffectiveRules().MinProbeSamples != 3 {
+		t.Fatalf("min_probe_samples = %d, want 3", cfg.Pools[0].EffectiveRules().MinProbeSamples)
 	}
 }
 

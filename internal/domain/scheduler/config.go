@@ -157,8 +157,11 @@ type ProviderConfig struct {
 	//   - false：明确不允许。
 	Allowed *bool `json:"allowed,omitempty"`
 	// CostWeight 是正常健康时的目标权重。
-	// 你把成本换算成相对权重后，主要就是填这个字段。
+	// 通常由 price_rmb_per_dao 自动换算；价格没填全时才手写兜底。
 	CostWeight float64 `json:"cost_weight"`
+	// PriceRMBPerDao 是这个 provider 的价格，单位是 RMB/刀。
+	// 如果同一个 pool 的可用 provider 都填写了价格，cost_weight 会自动按最低价换算。
+	PriceRMBPerDao float64 `json:"price_rmb_per_dao,omitempty"`
 	// MinWeight 是单个 provider 的探测权重覆盖值。
 	// 不写就是 0，Normalize/DecideProvider 会改用 pool rules 里的默认 MinWeight。
 	MinWeight float64 `json:"min_weight"`
@@ -218,7 +221,7 @@ func NormalizeConfig(cfg Config) (RuntimeConfig, error) {
 			cfg.Probe.Prompt = "ping"
 		}
 		if cfg.Probe.Samples <= 0 {
-			cfg.Probe.Samples = 2
+			cfg.Probe.Samples = 3
 		}
 		// 主动测速会真的调用上游，为了避免误配置导致费用失控，单轮样本数做硬上限。
 		if cfg.Probe.Samples > 5 {
@@ -321,12 +324,16 @@ func NormalizeConfig(cfg Config) (RuntimeConfig, error) {
 			if provider.CostWeight < 0 {
 				return RuntimeConfig{}, fmt.Errorf("pool %s provider %s cost_weight cannot be negative", pool.ID, provider.Name)
 			}
+			if provider.PriceRMBPerDao < 0 {
+				return RuntimeConfig{}, fmt.Errorf("pool %s provider %s price_rmb_per_dao cannot be negative", pool.ID, provider.Name)
+			}
 			// min_weight 允许为 0。
 			// 0 的意思是使用 pool rules 里的默认 MinWeight。
 			if provider.MinWeight < 0 {
 				return RuntimeConfig{}, fmt.Errorf("pool %s provider %s min_weight cannot be negative", pool.ID, provider.Name)
 			}
 		}
+		deriveCostWeightsFromPrices(pool)
 	}
 
 	// 返回 RuntimeConfig，把补完默认值的 cfg 和解析后的时间一起交给上层。
@@ -335,6 +342,39 @@ func NormalizeConfig(cfg Config) (RuntimeConfig, error) {
 		WindowDuration:   window,
 		CooldownDuration: cooldown,
 	}, nil
+}
+
+// deriveCostWeightsFromPrices 用 RMB/刀 自动换算 cost_weight。
+//
+// 只有同一个 pool 的所有可用 provider 都写了价格时才换算。
+// 这样不会因为只补了一个渠道价格，就把这个渠道误算成最低价权重 1。
+func deriveCostWeightsFromPrices(pool *PoolConfig) {
+	minPrice := 0.0
+	eligible := 0
+	priced := 0
+	for _, provider := range pool.Providers {
+		if !provider.AllowedInPool() {
+			continue
+		}
+		eligible++
+		if provider.PriceRMBPerDao <= 0 {
+			continue
+		}
+		priced++
+		if minPrice == 0 || provider.PriceRMBPerDao < minPrice {
+			minPrice = provider.PriceRMBPerDao
+		}
+	}
+	if eligible == 0 || priced != eligible || minPrice <= 0 {
+		return
+	}
+	for i := range pool.Providers {
+		provider := &pool.Providers[i]
+		if !provider.AllowedInPool() || provider.PriceRMBPerDao <= 0 {
+			continue
+		}
+		provider.CostWeight = ClampWeight(minPrice/provider.PriceRMBPerDao, 0, 1)
+	}
 }
 
 // defaultMinActiveProviders 返回默认最小活跃 provider 数。
@@ -359,7 +399,7 @@ func DefaultPoolRules() PoolRules {
 		MinErrors:                 3,
 		CriticalErrorThreshold:    2,
 		MinLatencySamples:         5,
-		MinProbeSamples:           2,
+		MinProbeSamples:           3,
 		RequiredBadWindows:        2,
 		TTFTPriority:              0.75,
 		MinWeightChange:           0.02,

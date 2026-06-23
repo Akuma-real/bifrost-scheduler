@@ -17,9 +17,12 @@ package main
 // notify：复用 Telegram Bot API 客户端和按钮结构。
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"html"
 	"log/slog"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -46,7 +49,8 @@ type daemonState struct {
 	lastPlan  *domain.Plan
 	lastError string
 
-	mutedUntil time.Time
+	mutedUntil   time.Time
+	pendingPrice *priceUpdate
 }
 
 // daemonSnapshot 是 daemonState 的只读快照。
@@ -54,13 +58,14 @@ type daemonState struct {
 // 复制一份快照出来以后，就可以释放锁，再慢慢格式化文本。
 // 这样不会让 Telegram 回复过程长时间占着锁。
 type daemonSnapshot struct {
-	startedAt  time.Time
-	interval   time.Duration
-	apply      bool
-	lastRunAt  time.Time
-	lastPlan   *domain.Plan
-	lastError  string
-	mutedUntil time.Time
+	startedAt    time.Time
+	interval     time.Duration
+	apply        bool
+	lastRunAt    time.Time
+	lastPlan     *domain.Plan
+	lastError    string
+	mutedUntil   time.Time
+	pendingPrice *priceUpdate
 }
 
 // newDaemonState 创建 daemonState。
@@ -108,15 +113,21 @@ func (s *daemonState) snapshot() daemonSnapshot {
 		p := *s.lastPlan
 		copiedPlan = &p
 	}
+	var copiedPendingPrice *priceUpdate
+	if s.pendingPrice != nil {
+		p := *s.pendingPrice
+		copiedPendingPrice = &p
+	}
 
 	return daemonSnapshot{
-		startedAt:  s.startedAt,
-		interval:   s.interval,
-		apply:      s.apply,
-		lastRunAt:  s.lastRunAt,
-		lastPlan:   copiedPlan,
-		lastError:  s.lastError,
-		mutedUntil: s.mutedUntil,
+		startedAt:    s.startedAt,
+		interval:     s.interval,
+		apply:        s.apply,
+		lastRunAt:    s.lastRunAt,
+		lastPlan:     copiedPlan,
+		lastError:    s.lastError,
+		mutedUntil:   s.mutedUntil,
+		pendingPrice: copiedPendingPrice,
 	}
 }
 
@@ -149,6 +160,30 @@ func (s *daemonState) mutedUntilText() string {
 		return ""
 	}
 	return s.mutedUntil.Format(time.RFC3339)
+}
+
+// setPendingPrice 保存一条待确认的价格修改。
+func (s *daemonState) setPendingPrice(update priceUpdate) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pendingPrice = &update
+}
+
+// clearPendingPrice 清掉待确认价格修改。
+func (s *daemonState) clearPendingPrice() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pendingPrice = nil
+}
+
+// getPendingPrice 取出待确认价格修改。
+func (s *daemonState) getPendingPrice() (priceUpdate, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pendingPrice == nil {
+		return priceUpdate{}, false
+	}
+	return *s.pendingPrice, true
 }
 
 // startTelegramControl 启动 Telegram 指令监听。
@@ -207,6 +242,31 @@ type telegramControl struct {
 	opts          options
 	state         *daemonState
 	allowedChatID int64
+}
+
+// priceUpdate 是一次待确认的价格修改。
+type priceUpdate struct {
+	PoolID   string
+	Provider string
+	Price    float64
+	Preview  priceUpdatePreview
+}
+
+// priceUpdatePreview 是修改价格后的配置预览。
+type priceUpdatePreview struct {
+	PoolID    string
+	Provider  string
+	OldPrice  float64
+	NewPrice  float64
+	Providers []priceProviderPreview
+}
+
+// priceProviderPreview 展示同一个 pool 里每个 provider 的价格和换算权重。
+type priceProviderPreview struct {
+	Name       string
+	Price      float64
+	CostWeight float64
+	Allowed    bool
 }
 
 // run 持续调用 getUpdates 读取 Telegram 消息。
@@ -286,6 +346,15 @@ func (c telegramControl) handleCommand(ctx context.Context, raw string) {
 		c.reply(ctx, lastPlanText(c.state.snapshot()), mainKeyboard())
 	case "/run", "run":
 		c.runDryPlan(ctx)
+	case "/prices", "prices":
+		c.listPrices(ctx)
+	case "/price", "price":
+		c.previewPriceUpdate(ctx, arg)
+	case "/price_apply", "price_apply":
+		c.applyPendingPrice(ctx)
+	case "/price_cancel", "price_cancel":
+		c.state.clearPendingPrice()
+		c.reply(ctx, "已取消价格修改。", mainKeyboard())
 	case "/mute", "mute":
 		c.mute(ctx, arg)
 	case "/unmute", "unmute":
@@ -309,6 +378,79 @@ func (c telegramControl) runDryPlan(ctx context.Context) {
 	}
 	c.state.recordPlan(plan)
 	c.reply(ctx, manualRunText(plan), mainKeyboard())
+}
+
+// listPrices 展示当前配置中的 RMB/刀 和派生权重。
+func (c telegramControl) listPrices(ctx context.Context) {
+	cfg, err := loadRawConfig(c.opts.ConfigPath)
+	if err != nil {
+		c.reply(ctx, "<b>读取价格失败</b>\n\n<code>"+html.EscapeString(err.Error())+"</code>", mainKeyboard())
+		return
+	}
+	runtimeCfg, err := domain.NormalizeConfig(cfg)
+	if err != nil {
+		c.reply(ctx, "<b>解析价格失败</b>\n\n<code>"+html.EscapeString(err.Error())+"</code>", mainKeyboard())
+		return
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "<b>当前渠道价格</b>\n")
+	for _, pool := range runtimeCfg.Pools {
+		fmt.Fprintf(&b, "\n<b>%s</b>", html.EscapeString(pool.ID))
+		if pool.VirtualKey != "" && pool.VirtualKey != pool.ID {
+			fmt.Fprintf(&b, "（VK: <code>%s</code>）", html.EscapeString(pool.VirtualKey))
+		}
+		fmt.Fprintf(&b, "\n")
+		for _, provider := range pool.Providers {
+			if !provider.AllowedInPool() {
+				continue
+			}
+			price := "-"
+			if provider.PriceRMBPerDao > 0 {
+				price = fmt.Sprintf("%.6g RMB/刀", provider.PriceRMBPerDao)
+			}
+			fmt.Fprintf(&b, "- <code>%s</code>：<code>%s</code>，cost_weight <code>%.4f</code>\n",
+				html.EscapeString(provider.Name), html.EscapeString(price), effectiveCostWeight(provider, pool.EffectiveRules()))
+		}
+	}
+	c.reply(ctx, b.String(), mainKeyboard())
+}
+
+// previewPriceUpdate 预览一次价格修改，不立即写配置。
+func (c telegramControl) previewPriceUpdate(ctx context.Context, arg string) {
+	update, err := parsePriceUpdate(arg)
+	if err != nil {
+		c.reply(ctx, "格式不对。例子：<code>/price gpt_low congmingai_openai_lv1 0.055</code>", mainKeyboard())
+		return
+	}
+	_, preview, err := configWithPrice(c.opts.ConfigPath, update.PoolID, update.Provider, update.Price)
+	if err != nil {
+		c.reply(ctx, "<b>价格预览失败</b>\n\n<code>"+html.EscapeString(err.Error())+"</code>", mainKeyboard())
+		return
+	}
+	update.Preview = preview
+	c.state.setPendingPrice(update)
+	c.reply(ctx, pricePreviewText(preview), priceConfirmKeyboard())
+}
+
+// applyPendingPrice 写入最近一次预览过的价格修改。
+func (c telegramControl) applyPendingPrice(ctx context.Context) {
+	update, ok := c.state.getPendingPrice()
+	if !ok {
+		c.reply(ctx, "没有待确认的价格修改。先发送 <code>/price pool provider 0.055</code>。", mainKeyboard())
+		return
+	}
+	cfg, preview, err := configWithPrice(c.opts.ConfigPath, update.PoolID, update.Provider, update.Price)
+	if err != nil {
+		c.reply(ctx, "<b>价格写入失败</b>\n\n<code>"+html.EscapeString(err.Error())+"</code>", mainKeyboard())
+		return
+	}
+	if err := writeRawConfig(c.opts.ConfigPath, cfg); err != nil {
+		c.reply(ctx, "<b>价格写入失败</b>\n\n<code>"+html.EscapeString(err.Error())+"</code>", mainKeyboard())
+		return
+	}
+	c.state.clearPendingPrice()
+	c.reply(ctx, "<b>价格已写入配置</b>\n\n"+pricePreviewText(preview), mainKeyboard())
 }
 
 // mute 处理 /mute 命令。
@@ -395,6 +537,8 @@ func telegramCommands() []notify.TelegramBotCommand {
 		{Command: "status", Description: "查看调度器状态"},
 		{Command: "last", Description: "查看最近一次调度计划摘要"},
 		{Command: "run", Description: "立即执行一次 dry-run 预览"},
+		{Command: "prices", Description: "查看当前渠道价格"},
+		{Command: "price", Description: "预览价格修改：/price pool provider 0.055"},
 		{Command: "mute", Description: "静音变更通知，例如 /mute 1h"},
 		{Command: "unmute", Description: "恢复变更通知"},
 		{Command: "help", Description: "查看可用命令"},
@@ -410,6 +554,7 @@ func mainKeyboard() [][]notify.TelegramInlineButton {
 		},
 		{
 			{Text: "立即 dry-run", CallbackData: "run"},
+			{Text: "价格", CallbackData: "prices"},
 			{Text: "静音 1h", CallbackData: "mute 1h"},
 			{Text: "恢复通知", CallbackData: "unmute"},
 		},
@@ -425,12 +570,14 @@ func helpText() string {
 <code>/status</code> - 查看 daemon 是否运行、多久跑一次、最近是否报错
 <code>/last</code> - 查看最近一次调度摘要
 <code>/run</code> - 立即执行一次 dry-run 预览，不写线上
+<code>/prices</code> - 查看当前配置里的 RMB/刀价格
+<code>/price pool provider 0.055</code> - 预览修改某个渠道价格
 <code>/mute 1h</code> - 静音变更通知，调度器仍继续运行
 <code>/unmute</code> - 恢复变更通知
 <code>/help</code> - 查看帮助
 
 安全边界：
-Telegram 交互不提供直接写线上命令。自动写入仍只由 daemon 的 <code>config mode</code> 和 <code>--apply</code> 控制。
+Telegram 价格命令只写调度器配置。真正写 Bifrost 仍只由 daemon 的 <code>config mode</code> 和 <code>--apply</code> 控制。
 `)
 }
 
@@ -483,6 +630,233 @@ func lastPlanText(snapshot daemonSnapshot) string {
 // manualRunText 把手动 dry-run 结果压缩成 Telegram 文本。
 func manualRunText(plan domain.Plan) string {
 	return planSummaryText("手动 dry-run 完成", plan)
+}
+
+// parsePriceUpdate 解析 /price pool provider 0.055。
+func parsePriceUpdate(arg string) (priceUpdate, error) {
+	fields := strings.Fields(arg)
+	if len(fields) != 3 {
+		return priceUpdate{}, fmt.Errorf("price command requires pool provider price")
+	}
+	price, err := strconv.ParseFloat(fields[2], 64)
+	if err != nil || price <= 0 {
+		return priceUpdate{}, fmt.Errorf("price must be positive")
+	}
+	return priceUpdate{PoolID: fields[0], Provider: fields[1], Price: price}, nil
+}
+
+// loadRawConfig 读取未标准化的 JSON 配置。
+func loadRawConfig(path string) (domain.Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return domain.Config{}, err
+	}
+	var cfg domain.Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return domain.Config{}, err
+	}
+	return cfg, nil
+}
+
+// writeRawConfig 写回 JSON 配置。
+func writeRawConfig(path string, cfg domain.Config) error {
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	return os.WriteFile(path, data, 0600)
+}
+
+// configWithPrice 返回修改价格后的配置和预览。
+func configWithPrice(path, poolID, providerName string, price float64) (domain.Config, priceUpdatePreview, error) {
+	cfg, err := loadRawConfig(path)
+	if err != nil {
+		return domain.Config{}, priceUpdatePreview{}, err
+	}
+	poolRef := poolID
+	oldRuntimeCfg, err := domain.NormalizeConfig(cfg)
+	if err != nil {
+		return domain.Config{}, priceUpdatePreview{}, err
+	}
+	oldRuntimePool, oldRuntimeProvider, ok := runtimePoolProvider(oldRuntimeCfg, poolRef, providerName)
+	if !ok {
+		if _, poolOK := runtimePool(oldRuntimeCfg, poolRef); !poolOK {
+			return domain.Config{}, priceUpdatePreview{}, fmt.Errorf("pool %q not found", poolRef)
+		}
+		return domain.Config{}, priceUpdatePreview{}, fmt.Errorf("provider %q not found in pool %q", providerName, poolRef)
+	}
+	poolID = oldRuntimePool.ID
+	if !oldRuntimeProvider.AllowedInPool() {
+		return domain.Config{}, priceUpdatePreview{}, fmt.Errorf("provider %q is not allowed in pool %q", providerName, poolID)
+	}
+
+	foundPool := false
+	foundProvider := false
+	oldPrice := 0.0
+	for i := range cfg.Pools {
+		pool := &cfg.Pools[i]
+		if pool.ID != poolID {
+			continue
+		}
+		foundPool = true
+		for j := range pool.Providers {
+			provider := &pool.Providers[j]
+			if provider.Name != providerName {
+				continue
+			}
+			foundProvider = true
+			oldPrice = provider.PriceRMBPerDao
+			provider.PriceRMBPerDao = price
+		}
+		if err := fillMissingPoolPrices(pool, oldRuntimePool, oldRuntimeProvider, price); err != nil {
+			return domain.Config{}, priceUpdatePreview{}, err
+		}
+	}
+	if !foundPool {
+		return domain.Config{}, priceUpdatePreview{}, fmt.Errorf("pool %q not found", poolID)
+	}
+	if !foundProvider {
+		return domain.Config{}, priceUpdatePreview{}, fmt.Errorf("provider %q not found in pool %q", providerName, poolID)
+	}
+	runtimeCfg, err := domain.NormalizeConfig(cfg)
+	if err != nil {
+		return domain.Config{}, priceUpdatePreview{}, err
+	}
+	preview := priceUpdatePreview{
+		PoolID:   poolID,
+		Provider: providerName,
+		OldPrice: oldPrice,
+		NewPrice: price,
+	}
+	newRuntimePool, ok := runtimePool(runtimeCfg, poolID)
+	if !ok {
+		return domain.Config{}, priceUpdatePreview{}, fmt.Errorf("pool %q not found after normalization", poolID)
+	}
+	for _, pool := range runtimeCfg.Pools {
+		if pool.ID != poolID {
+			continue
+		}
+		for _, provider := range pool.Providers {
+			preview.Providers = append(preview.Providers, priceProviderPreview{
+				Name:       provider.Name,
+				Price:      provider.PriceRMBPerDao,
+				CostWeight: provider.CostWeight,
+				Allowed:    provider.AllowedInPool(),
+			})
+		}
+	}
+	for i := range cfg.Pools {
+		pool := &cfg.Pools[i]
+		if pool.ID != poolID {
+			continue
+		}
+		for j := range pool.Providers {
+			runtimeProvider, ok := providerInPool(newRuntimePool, pool.Providers[j].Name)
+			if !ok {
+				continue
+			}
+			pool.Providers[j].CostWeight = runtimeProvider.CostWeight
+		}
+	}
+	return cfg, preview, nil
+}
+
+// fillMissingPoolPrices 用旧 cost_weight 比例补齐同池缺失价格。
+//
+// 老配置可能只有 cost_weight，没有 price_rmb_per_dao。用户在 Telegram 里给一个渠道输入 RMB/刀 后，
+// 这里会按旧权重比例反推同池其他渠道价格，再让 NormalizeConfig 统一重新换算 cost_weight。
+func fillMissingPoolPrices(pool *domain.PoolConfig, runtimePool domain.PoolConfig, targetProvider domain.ProviderConfig, targetPrice float64) error {
+	targetWeight := effectiveCostWeight(targetProvider, runtimePool.EffectiveRules())
+	if targetWeight <= 0 {
+		return fmt.Errorf("provider %q has no usable cost_weight for price conversion", targetProvider.Name)
+	}
+	for i := range pool.Providers {
+		rawProvider := &pool.Providers[i]
+		runtimeProvider, ok := providerInPool(runtimePool, rawProvider.Name)
+		if !ok || !runtimeProvider.AllowedInPool() || rawProvider.PriceRMBPerDao > 0 {
+			continue
+		}
+		weight := effectiveCostWeight(runtimeProvider, runtimePool.EffectiveRules())
+		if weight <= 0 {
+			return fmt.Errorf("provider %q has no usable cost_weight for price conversion", runtimeProvider.Name)
+		}
+		rawProvider.PriceRMBPerDao = targetPrice * targetWeight / weight
+	}
+	return nil
+}
+
+// effectiveCostWeight 返回真正参与换算的健康目标权重。
+func effectiveCostWeight(provider domain.ProviderConfig, rules domain.PoolRules) float64 {
+	if provider.CostWeight > 0 {
+		return provider.CostWeight
+	}
+	return rules.DefaultCostWeight
+}
+
+// runtimePoolProvider 在已标准化配置里找 pool 和 provider。
+func runtimePoolProvider(cfg domain.RuntimeConfig, poolID, providerName string) (domain.PoolConfig, domain.ProviderConfig, bool) {
+	pool, ok := runtimePool(cfg, poolID)
+	if !ok {
+		return domain.PoolConfig{}, domain.ProviderConfig{}, false
+	}
+	provider, ok := providerInPool(pool, providerName)
+	if !ok {
+		return domain.PoolConfig{}, domain.ProviderConfig{}, false
+	}
+	return pool, provider, true
+}
+
+// runtimePool 在已标准化配置里找 pool。
+func runtimePool(cfg domain.RuntimeConfig, poolID string) (domain.PoolConfig, bool) {
+	for _, pool := range cfg.Pools {
+		if pool.ID == poolID || pool.VirtualKey == poolID {
+			return pool, true
+		}
+	}
+	return domain.PoolConfig{}, false
+}
+
+// providerInPool 在 pool 里按名称找 provider。
+func providerInPool(pool domain.PoolConfig, providerName string) (domain.ProviderConfig, bool) {
+	for _, provider := range pool.Providers {
+		if provider.Name == providerName {
+			return provider, true
+		}
+	}
+	return domain.ProviderConfig{}, false
+}
+
+// pricePreviewText 格式化价格修改预览。
+func pricePreviewText(preview priceUpdatePreview) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "<b>价格修改预览</b>\n\nPool：<code>%s</code>\nProvider：<code>%s</code>\n价格：<code>%.6g</code> -&gt; <code>%.6g RMB/刀</code>\n\n同池权重：\n",
+		html.EscapeString(preview.PoolID),
+		html.EscapeString(preview.Provider),
+		preview.OldPrice,
+		preview.NewPrice,
+	)
+	for _, provider := range preview.Providers {
+		if !provider.Allowed {
+			continue
+		}
+		fmt.Fprintf(&b, "- <code>%s</code>：价格 <code>%.6g</code>，cost_weight <code>%.4f</code>\n",
+			html.EscapeString(provider.Name),
+			provider.Price,
+			provider.CostWeight,
+		)
+	}
+	return b.String()
+}
+
+// priceConfirmKeyboard 返回价格写入确认按钮。
+func priceConfirmKeyboard() [][]notify.TelegramInlineButton {
+	return [][]notify.TelegramInlineButton{
+		{
+			{Text: "确认写入配置", CallbackData: "price_apply"},
+			{Text: "取消", CallbackData: "price_cancel"},
+		},
+	}
 }
 
 // planSummaryText 生成短计划摘要。

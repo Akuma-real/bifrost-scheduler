@@ -497,6 +497,17 @@ func TestFingerprintIgnoresDecisionOrder(t *testing.T) {
 	}
 }
 
+// TestFingerprintIgnoresCurrentWeight 验证同一个目标动作不会因为上一轮已写入 current weight 而重复通知。
+func TestFingerprintIgnoresCurrentWeight(t *testing.T) {
+	first := samplePlan()
+	second := samplePlan()
+	second.Decisions[0].CurrentWeight = 0.2
+
+	if Fingerprint(first) != Fingerprint(second) {
+		t.Fatalf("fingerprints differ when only current weight changes")
+	}
+}
+
 // samplePlan 构造一份有单个变更的测试计划。
 func samplePlan() domain.Plan {
 	return domain.Plan{

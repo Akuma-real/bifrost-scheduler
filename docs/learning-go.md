@@ -314,7 +314,7 @@ config.go 的 ProbeConfig
   -> planner.go 调用 LoadProbeMetrics
   -> client.go 发 provider/model 流式请求
   -> 收到第一条 SSE data 记录 TTFT
-  -> decision_service.go 按首字优先、成本其次算目标权重
+  -> decision_service.go 在业务样本足够时按首字优先、成本其次算目标权重
 ```
 
 重点看这几个函数：
@@ -323,7 +323,7 @@ config.go 的 ProbeConfig
 - `LoadProbeMetrics()`：只有 `probe.enabled=true` 才会发主动测速请求。
 - `probeOnce()`：真正发 `/v1/chat/completions` 流式请求，记录首字时间。
 - `MergeProbeMetrics()`：把主动测速结果合并到普通指标里。
-- `probeDecision()`：用主动测速证据做温和调权。
+- `probeDecision()`：用主动测速证据做明确异常处理；业务样本足够时才做首字重排。
 
 这里要记住一个边界：`p95_latency_ms` 是 Bifrost 日志里的总耗时；`p95_ttft_ms` 是主动流式测速拿到的首字时间。
 

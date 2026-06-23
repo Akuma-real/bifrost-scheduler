@@ -240,7 +240,7 @@ func runPlan(ctx context.Context, logger *slog.Logger, opts options, apply bool)
 	}
 	// 写一行简短日志，方便 docker logs 查看。
 	logPlanSummary(logger, plan)
-	// plan 命令是一次性运行；只要有变更，就发送一次 Telegram 通知。
+	// plan 命令是一次性运行；只有 warning/critical 问题决策才发送 Telegram 通知。
 	notifyPlan(ctx, logger, opts, plan)
 	// 如果有 critical 决策，命令返回 10，方便外部自动化识别严重问题。
 	if hasCritical(plan) {
@@ -398,6 +398,7 @@ func telegramChatIDInt(opts options) (int64, error) {
 //
 // 通知失败只写日志，不影响调度器本身。
 func notifyPlan(ctx context.Context, logger *slog.Logger, opts options, plan domain.Plan) bool {
+	plan = notificationPlan(plan)
 	notifier, err := newNotifier(opts)
 	if err != nil {
 		logger.Error("telegram notification setup failed", "error", err)
@@ -426,6 +427,7 @@ func notifyPlan(ctx context.Context, logger *slog.Logger, opts options, plan dom
 //
 // 返回值是新的 lastNotificationFingerprint。
 func notifyPlanOnce(ctx context.Context, logger *slog.Logger, opts options, plan domain.Plan, lastFingerprint string) string {
+	plan = notificationPlan(plan)
 	if len(plan.Decisions) == 0 {
 		return ""
 	}
@@ -437,6 +439,21 @@ func notifyPlanOnce(ctx context.Context, logger *slog.Logger, opts options, plan
 		return fingerprint
 	}
 	return lastFingerprint
+}
+
+// notificationPlan 只保留需要主动推送到 Telegram 的问题决策。
+//
+// info 级别通常是健康恢复或正常调权，完整报告里仍然会记录，
+// 但不应该像渠道故障一样刷 Telegram。
+func notificationPlan(plan domain.Plan) domain.Plan {
+	filtered := plan
+	filtered.Decisions = make([]domain.Decision, 0, len(plan.Decisions))
+	for _, decision := range plan.Decisions {
+		if decision.Severity == "warning" || decision.Severity == "critical" {
+			filtered.Decisions = append(filtered.Decisions, decision)
+		}
+	}
+	return filtered
 }
 
 // logPlanSummary 在每次调度后写一行简短摘要。

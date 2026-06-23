@@ -687,8 +687,8 @@ func TestProbeTTFTPriorityAdjustsHealthyWeights(t *testing.T) {
 	}
 }
 
-// TestProbeTTFTWorksWhenTrafficSamplesAreLow 验证业务流量低时，主动测速仍然可以提供首字调权证据。
-func TestProbeTTFTWorksWhenTrafficSamplesAreLow(t *testing.T) {
+// TestProbeTTFTPrioritySkipsLowTrafficSamples 验证低业务流量时，不用少量测速反复重排健康权重。
+func TestProbeTTFTPrioritySkipsLowTrafficSamples(t *testing.T) {
 	cfg, err := NormalizeConfig(Config{
 		Probe:           ProbeConfig{Enabled: true, Model: "gpt-5.5", Samples: 2},
 		MinimumAttempts: 10,
@@ -728,17 +728,8 @@ func TestProbeTTFTWorksWhenTrafficSamplesAreLow(t *testing.T) {
 		metrics,
 		false,
 	)
-	foundSlow := false
-	for _, decision := range decisions {
-		if decision.Provider == "slow_provider" {
-			foundSlow = true
-			if decision.Action != "set_weight" || decision.TargetWeight >= 1 {
-				t.Fatalf("slow decision = %+v, want lower weight from probe evidence", decision)
-			}
-		}
-	}
-	if !foundSlow {
-		t.Fatalf("decisions = %+v, want slow provider adjusted even with low traffic", decisions)
+	if len(decisions) != 0 {
+		t.Fatalf("decisions = %+v, want no ttft-priority adjustment with low traffic", decisions)
 	}
 }
 

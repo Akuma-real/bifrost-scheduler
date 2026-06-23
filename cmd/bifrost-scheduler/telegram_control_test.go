@@ -10,6 +10,7 @@ package main
 // domain：构造测试用调度计划。
 import (
 	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -102,4 +103,142 @@ func TestStatusAndLastPlanText(t *testing.T) {
 	if !strings.Contains(last, "<code>provider_b</code>") {
 		t.Fatalf("last text = %q, want provider name", last)
 	}
+}
+
+// TestNotificationPlanKeepsOnlyProblemDecisions 验证自动 TG 只推送 warning/critical 问题。
+func TestNotificationPlanKeepsOnlyProblemDecisions(t *testing.T) {
+	plan := domain.Plan{Decisions: []domain.Decision{
+		{Provider: "healthy_restore", Severity: "info"},
+		{Provider: "bad_channel", Severity: "warning"},
+		{Provider: "broken_channel", Severity: "critical"},
+	}}
+
+	filtered := notificationPlan(plan)
+	if len(filtered.Decisions) != 2 {
+		t.Fatalf("filtered decisions = %+v, want warning and critical only", filtered.Decisions)
+	}
+	if filtered.Decisions[0].Provider != "bad_channel" || filtered.Decisions[1].Provider != "broken_channel" {
+		t.Fatalf("filtered decisions = %+v, want problem decisions only", filtered.Decisions)
+	}
+	if len(plan.Decisions) != 3 {
+		t.Fatalf("original plan decisions changed: %+v", plan.Decisions)
+	}
+}
+
+// TestParsePriceUpdate 验证 Telegram 价格命令解析。
+func TestParsePriceUpdate(t *testing.T) {
+	update, err := parsePriceUpdate("gpt_low provider_a 0.055")
+	if err != nil {
+		t.Fatalf("parsePriceUpdate returned error: %v", err)
+	}
+	if update.PoolID != "gpt_low" || update.Provider != "provider_a" || update.Price != 0.055 {
+		t.Fatalf("update = %+v, want parsed pool/provider/price", update)
+	}
+	if _, err := parsePriceUpdate("gpt_low provider_a 0"); err == nil {
+		t.Fatalf("parsePriceUpdate returned nil error, want positive price validation")
+	}
+}
+
+// TestConfigWithPriceBootstrapsMissingPricesFromCostWeight 验证老配置只有 cost_weight 时，
+// Telegram 输入一个 RMB/刀 价格就能按旧权重比例补齐同池价格，并自动换算 cost_weight。
+func TestConfigWithPriceBootstrapsMissingPricesFromCostWeight(t *testing.T) {
+	path := writeTestConfig(t, domain.Config{
+		Pools: []domain.PoolConfig{{
+			ID:         "gpt_low",
+			VirtualKey: "vk_low_text",
+			Providers: []domain.ProviderConfig{
+				{Name: "cheap", CostWeight: 1},
+				{Name: "expensive", CostWeight: 0.5},
+				{Name: "quarantine", Role: "quarantine", CostWeight: 1},
+			},
+		}},
+	})
+
+	cfg, preview, err := configWithPrice(path, "gpt_low", "expensive", 0.1)
+	if err != nil {
+		t.Fatalf("configWithPrice returned error: %v", err)
+	}
+
+	providers := cfg.Pools[0].Providers
+	if providers[0].PriceRMBPerDao != 0.05 {
+		t.Fatalf("cheap price = %.4f, want 0.05", providers[0].PriceRMBPerDao)
+	}
+	if providers[1].PriceRMBPerDao != 0.1 {
+		t.Fatalf("expensive price = %.4f, want 0.1", providers[1].PriceRMBPerDao)
+	}
+	if providers[0].CostWeight != 1 || providers[1].CostWeight != 0.5 {
+		t.Fatalf("providers = %+v, want derived cost weights 1 and 0.5", providers)
+	}
+	if providers[2].PriceRMBPerDao != 0 {
+		t.Fatalf("quarantine price = %.4f, want unchanged", providers[2].PriceRMBPerDao)
+	}
+	if preview.OldPrice != 0 || preview.NewPrice != 0.1 || len(preview.Providers) != 3 {
+		t.Fatalf("preview = %+v, want old/new prices and all providers", preview)
+	}
+}
+
+// TestConfigWithPriceUsesPriceAsSource 验证价格填全后，cost_weight 由 RMB/刀 自动派生。
+func TestConfigWithPriceUsesPriceAsSource(t *testing.T) {
+	path := writeTestConfig(t, domain.Config{
+		Pools: []domain.PoolConfig{{
+			ID:         "gpt_low",
+			VirtualKey: "vk_low_text",
+			Providers: []domain.ProviderConfig{
+				{Name: "cheap", PriceRMBPerDao: 0.05},
+				{Name: "expensive", PriceRMBPerDao: 0.1},
+			},
+		}},
+	})
+
+	cfg, preview, err := configWithPrice(path, "gpt_low", "expensive", 0.2)
+	if err != nil {
+		t.Fatalf("configWithPrice returned error: %v", err)
+	}
+
+	providers := cfg.Pools[0].Providers
+	if providers[0].CostWeight != 1 || providers[1].CostWeight != 0.25 {
+		t.Fatalf("providers = %+v, want cost_weight from prices 0.05/0.2", providers)
+	}
+	text := pricePreviewText(preview)
+	if !strings.Contains(text, "RMB/刀") || !strings.Contains(text, "cost_weight") {
+		t.Fatalf("preview text = %q, want price and cost_weight", text)
+	}
+}
+
+// TestConfigWithPriceAcceptsVirtualKeyName 验证 /price 第一个参数也可以写 Bifrost virtual_key。
+func TestConfigWithPriceAcceptsVirtualKeyName(t *testing.T) {
+	path := writeTestConfig(t, domain.Config{
+		Pools: []domain.PoolConfig{{
+			ID:         "gpt_low",
+			VirtualKey: "vk_low_text",
+			Providers: []domain.ProviderConfig{
+				{Name: "provider_a", PriceRMBPerDao: 0.05},
+				{Name: "provider_b", PriceRMBPerDao: 0.1},
+			},
+		}},
+	})
+
+	cfg, preview, err := configWithPrice(path, "vk_low_text", "provider_b", 0.2)
+	if err != nil {
+		t.Fatalf("configWithPrice returned error: %v", err)
+	}
+	if preview.PoolID != "gpt_low" {
+		t.Fatalf("preview pool = %q, want canonical pool id", preview.PoolID)
+	}
+	if cfg.Pools[0].Providers[1].PriceRMBPerDao != 0.2 {
+		t.Fatalf("provider_b price = %.4f, want 0.2", cfg.Pools[0].Providers[1].PriceRMBPerDao)
+	}
+}
+
+func writeTestConfig(t *testing.T, cfg domain.Config) string {
+	t.Helper()
+	path := t.TempDir() + "/config.json"
+	if err := writeRawConfig(path, cfg); err != nil {
+		t.Fatalf("writeRawConfig returned error: %v", err)
+	}
+	// 确认测试文件确实落盘，避免后续只测到内存里的 cfg。
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("stat config: %v", err)
+	}
+	return path
 }

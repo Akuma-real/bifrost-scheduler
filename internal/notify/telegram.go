@@ -586,12 +586,11 @@ func Fingerprint(plan domain.Plan) string {
 	parts := make([]string, 0, len(plan.Decisions))
 	for _, decision := range plan.Decisions {
 		parts = append(parts, fmt.Sprintf(
-			"%s\x00%s\x00%s\x00%s\x00%.4f\x00%.4f\x00%s\x00%s",
+			"%s\x00%s\x00%s\x00%s\x00%.4f\x00%s\x00%s",
 			decision.PoolID,
 			decision.VirtualKey,
 			decision.Provider,
 			decision.Action,
-			decision.CurrentWeight,
 			decision.TargetWeight,
 			decision.Severity,
 			decision.Reason,

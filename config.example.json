@@ -6,7 +6,7 @@
   "probe": {
     "enabled": false,
     "model": "gpt-5.5",
-    "samples": 2,
+    "samples": 3,
     "timeout": "20s"
   },
   "pools": [
@@ -16,16 +16,16 @@
       "providers": [
         {
           "name": "provider_a",
-          "cost_weight": 1
+          "price_rmb_per_dao": 0.045
         },
         {
           "name": "provider_b",
-          "cost_weight": 0.5
+          "price_rmb_per_dao": 0.09
         },
         {
           "name": "new_provider_c",
           "role": "candidate",
-          "cost_weight": 0.2,
+          "price_rmb_per_dao": 0.225,
           "min_weight": 0.05
         },
         {
@@ -40,11 +40,11 @@
       "providers": [
         {
           "name": "provider_e",
-          "cost_weight": 0.8
+          "price_rmb_per_dao": 0.05
         },
         {
           "name": "provider_f",
-          "cost_weight": 0.4
+          "price_rmb_per_dao": 0.1
         }
       ]
     }
