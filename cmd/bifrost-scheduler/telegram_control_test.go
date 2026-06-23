@@ -127,7 +127,7 @@ func TestNotificationPlanKeepsOnlyProblemDecisions(t *testing.T) {
 
 // TestParsePriceUpdate 验证 Telegram 价格命令解析。
 func TestParsePriceUpdate(t *testing.T) {
-	update, err := parsePriceUpdate("gpt_low provider_a 0.055")
+	update, err := parsePriceUpdate("gpt_low provider_a 0.055 RMB/刀")
 	if err != nil {
 		t.Fatalf("parsePriceUpdate returned error: %v", err)
 	}
@@ -136,6 +136,50 @@ func TestParsePriceUpdate(t *testing.T) {
 	}
 	if _, err := parsePriceUpdate("gpt_low provider_a 0"); err == nil {
 		t.Fatalf("parsePriceUpdate returned nil error, want positive price validation")
+	}
+}
+
+// TestPriceButtonHelpers 验证价格按钮会生成短 callback，并能解析用户输入的 RMB/刀。
+func TestPriceButtonHelpers(t *testing.T) {
+	cfg, err := domain.NormalizeConfig(domain.Config{
+		Pools: []domain.PoolConfig{{
+			ID:         "gpt_low",
+			VirtualKey: "vk_low_text",
+			Providers: []domain.ProviderConfig{
+				{Name: "provider_a", PriceRMBPerDao: 0.05},
+				{Name: "provider_b", PriceRMBPerDao: 0.1},
+				{Name: "provider_c", Role: "quarantine", PriceRMBPerDao: 0.2},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("NormalizeConfig returned error: %v", err)
+	}
+
+	poolKeyboard := pricePoolsKeyboard(cfg)
+	if poolKeyboard[0][0].CallbackData != "price_pool 0" {
+		t.Fatalf("pool callback = %q, want price_pool 0", poolKeyboard[0][0].CallbackData)
+	}
+	providerKeyboard := priceProvidersKeyboard(cfg.Pools[0], 0)
+	if len(providerKeyboard) != 3 {
+		t.Fatalf("provider keyboard rows = %d, want two allowed providers plus back", len(providerKeyboard))
+	}
+	if providerKeyboard[1][0].CallbackData != "price_provider 0 1" {
+		t.Fatalf("provider callback = %q, want price_provider 0 1", providerKeyboard[1][0].CallbackData)
+	}
+	poolIndex, providerIndex, err := parseProviderCallback("0 1")
+	if err != nil {
+		t.Fatalf("parseProviderCallback returned error: %v", err)
+	}
+	if poolIndex != 0 || providerIndex != 1 {
+		t.Fatalf("indexes = %d/%d, want 0/1", poolIndex, providerIndex)
+	}
+	price, err := parsePriceText("0.055 RMB/刀")
+	if err != nil {
+		t.Fatalf("parsePriceText returned error: %v", err)
+	}
+	if price != 0.055 {
+		t.Fatalf("price = %.4f, want 0.055", price)
 	}
 }
 

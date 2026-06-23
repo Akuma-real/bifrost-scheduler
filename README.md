@@ -189,14 +189,14 @@ Telegram 交互控制台只在 `daemon` 模式下生效，使用 Telegram `getUp
 /last       查看最近一次调度计划摘要
 /run        立即执行一次 dry-run 预览，不写线上
 /prices     查看当前配置里的 RMB/刀 和派生 cost_weight
-/price key provider 0.055
-            预览修改某个渠道价格，确认后写调度器配置
 /mute 1h    静音变更通知，调度器仍继续运行
 /unmute     恢复变更通知
 /help       查看帮助
 ```
 
-注意：Telegram `/run` 永远是 dry-run。`/price` 确认后只写调度器配置文件，不直接调用 Bifrost。真正写 Bifrost 仍然只由 `config.json` 的 `mode=guarded_write` 和 daemon 命令里的 `--apply` 控制。
+调整价格不用记命令：点“价格” -> “调整价格” -> 选 key -> 选渠道 -> 发送 `0.055 RMB/刀` -> 确认写入配置。`/price key provider 0.055` 仍保留作兜底。
+
+注意：Telegram `/run` 永远是 dry-run。价格确认后只写调度器配置文件，不直接调用 Bifrost。真正写 Bifrost 仍然只由 `config.json` 的 `mode=guarded_write` 和 daemon 命令里的 `--apply` 控制。
 
 也可以用命令行覆盖 API 地址：
 
