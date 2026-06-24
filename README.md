@@ -176,27 +176,23 @@ BIFROST_SCHEDULER_TG_CHAT_ID=-1001234567890
 BIFROST_SCHEDULER_TG_INTERACTIVE=true
 ```
 
-通知失败不会阻断调度，只会写一条错误日志。没有问题决策，或只有健康恢复/普通调权这类 `info` 决策时不发通知。动作较多或消息较长时，Telegram 通知会自动拆成多条发送，交互按钮只放在最后一条。
+通知失败不会阻断调度，只会写一条错误日志。没有问题决策，或只有健康恢复/普通调权这类 `info` 决策时不发通知。动作较多或消息较长时，Telegram 通知会自动拆成多条发送。
 
 Telegram 交互控制台只在 `daemon` 模式下生效，使用 Telegram `getUpdates` 长轮询，不需要 webhook，也不需要开放公网端口。为了安全，只有 `BIFROST_SCHEDULER_TG_CHAT_ID` 配置的 chat 可以操作。
 
-交互回复会使用 Telegram HTML 富文本显示粗体和等宽代码；执行 `/run` 等需要等待 Bifrost API 的命令时，bot 会先显示“正在输入...”，避免看起来像没反应。
+交互回复会使用 Telegram HTML 富文本显示粗体和等宽代码；执行“立即 dry-run”等需要等待 Bifrost API 的按钮时，bot 会先显示“正在输入...”，避免看起来像没反应。
 
-可用命令：
+主入口是输入框上方的常驻键盘，不需要手打命令：
 
 ```text
-/status     查看 daemon 状态、运行间隔、最近错误
-/last       查看最近一次调度计划摘要
-/run        立即执行一次 dry-run 预览，不写线上
-/prices     查看当前配置里的 RMB/刀 和派生 cost_weight
-/mute 1h    静音变更通知，调度器仍继续运行
-/unmute     恢复变更通知
-/help       查看帮助
+状态 / 最近计划
+立即 dry-run / 价格
+静音 1h / 恢复通知
 ```
 
-调整价格不用记命令：点“价格” -> “调整价格” -> 选 key -> 选渠道 -> 发送 `0.055 RMB/刀` -> 确认写入配置。`/price key provider 0.055` 仍保留作兜底。
+调整价格流程：点“价格” -> “调整价格” -> 选 key -> 选渠道 -> 发送 `0.055 RMB/刀` -> 确认写入配置。
 
-注意：Telegram `/run` 永远是 dry-run。价格确认后只写调度器配置文件，不直接调用 Bifrost。真正写 Bifrost 仍然只由 `config.json` 的 `mode=guarded_write` 和 daemon 命令里的 `--apply` 控制。
+注意：“立即 dry-run”永远只预览。价格确认后只写调度器配置文件，不直接调用 Bifrost。真正写 Bifrost 仍然只由 `config.json` 的 `mode=guarded_write` 和 daemon 命令里的 `--apply` 控制。
 
 也可以用命令行覆盖 API 地址：
 

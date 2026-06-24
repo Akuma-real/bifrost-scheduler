@@ -78,6 +78,13 @@ type TelegramInlineButton struct {
 	CallbackData string `json:"callback_data"`
 }
 
+// TelegramKeyboardButton 表示 Telegram 输入框上方常驻键盘里的一个按钮。
+//
+// 这种按钮不会产生 callback；用户点击后，Telegram 会把 Text 当作普通消息发给 bot。
+type TelegramKeyboardButton struct {
+	Text string `json:"text"`
+}
+
 // TelegramBotCommand 表示 Telegram 左下角命令菜单里的一项。
 //
 // SetCommands 会把这些命令注册到 Telegram，这样用户不用记命令名。
@@ -200,6 +207,24 @@ func (n *TelegramNotifier) NotifyPlanWithKeyboard(ctx context.Context, plan doma
 	return nil
 }
 
+// NotifyPlanWithReplyKeyboard 把调度计划发送到 Telegram，并在最后一页刷新常驻键盘。
+func (n *TelegramNotifier) NotifyPlanWithReplyKeyboard(ctx context.Context, plan domain.Plan, keyboard [][]TelegramKeyboardButton) error {
+	if n == nil || len(plan.Decisions) == 0 {
+		return nil
+	}
+	parts := FormatPlanHTMLMessages(plan)
+	for i, text := range parts {
+		pageKeyboard := [][]TelegramKeyboardButton(nil)
+		if i == len(parts)-1 {
+			pageKeyboard = keyboard
+		}
+		if err := n.SendHTMLWithReplyKeyboard(ctx, text, pageKeyboard); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // SendText 发送一条普通 Telegram 文本消息。
 func (n *TelegramNotifier) SendText(ctx context.Context, text string) error {
 	return n.SendTextWithKeyboard(ctx, text, nil)
@@ -222,6 +247,16 @@ func (n *TelegramNotifier) SendHTMLWithKeyboard(ctx context.Context, text string
 	return n.sendMessage(ctx, text, TelegramParseHTML, keyboard)
 }
 
+// SendTextWithReplyKeyboard 发送文本消息，并可选刷新常驻键盘。
+func (n *TelegramNotifier) SendTextWithReplyKeyboard(ctx context.Context, text string, keyboard [][]TelegramKeyboardButton) error {
+	return n.sendMessageWithReplyKeyboard(ctx, text, "", keyboard)
+}
+
+// SendHTMLWithReplyKeyboard 发送 HTML 富文本，并可选刷新常驻键盘。
+func (n *TelegramNotifier) SendHTMLWithReplyKeyboard(ctx context.Context, text string, keyboard [][]TelegramKeyboardButton) error {
+	return n.sendMessageWithReplyKeyboard(ctx, text, TelegramParseHTML, keyboard)
+}
+
 // SendChatAction 调用 Telegram sendChatAction。
 //
 // action 常用值是 typing，客户端会显示“正在输入...”。
@@ -238,6 +273,28 @@ func (n *TelegramNotifier) SendChatAction(ctx context.Context, action string) er
 
 // sendMessage 是 sendMessage 的内部实现。
 func (n *TelegramNotifier) sendMessage(ctx context.Context, text, parseMode string, keyboard [][]TelegramInlineButton) error {
+	var replyMarkup *telegramReplyMarkup
+	if len(keyboard) > 0 {
+		replyMarkup = &telegramReplyMarkup{InlineKeyboard: keyboard}
+	}
+	return n.sendMessageWithMarkup(ctx, text, parseMode, replyMarkup)
+}
+
+// sendMessageWithReplyKeyboard 是常驻键盘版 sendMessage。
+func (n *TelegramNotifier) sendMessageWithReplyKeyboard(ctx context.Context, text, parseMode string, keyboard [][]TelegramKeyboardButton) error {
+	var replyMarkup *telegramReplyMarkup
+	if len(keyboard) > 0 {
+		replyMarkup = &telegramReplyMarkup{
+			Keyboard:       keyboard,
+			ResizeKeyboard: true,
+			IsPersistent:   true,
+		}
+	}
+	return n.sendMessageWithMarkup(ctx, text, parseMode, replyMarkup)
+}
+
+// sendMessageWithMarkup 组装 Telegram sendMessage 请求体。
+func (n *TelegramNotifier) sendMessageWithMarkup(ctx context.Context, text, parseMode string, replyMarkup *telegramReplyMarkup) error {
 	payload := telegramSendMessageRequest{
 		ChatID:                n.chatID,
 		Text:                  text,
@@ -249,9 +306,7 @@ func (n *TelegramNotifier) sendMessage(ctx context.Context, text, parseMode stri
 	if n.threadID > 0 {
 		payload.MessageThreadID = n.threadID
 	}
-	if len(keyboard) > 0 {
-		payload.ReplyMarkup = &telegramInlineKeyboardMarkup{InlineKeyboard: keyboard}
-	}
+	payload.ReplyMarkup = replyMarkup
 
 	return n.postTelegram(ctx, "sendMessage", payload, nil)
 }
@@ -301,6 +356,13 @@ func (n *TelegramNotifier) SetCommands(ctx context.Context, commands []TelegramB
 	}
 	payload := telegramSetCommandsRequest{Commands: commands}
 	return n.postTelegram(ctx, "setMyCommands", payload, nil)
+}
+
+// DeleteCommands 清空 Telegram 命令菜单。
+//
+// 常驻键盘作为主入口时，不再需要客户端显示一排 slash 命令。
+func (n *TelegramNotifier) DeleteCommands(ctx context.Context) error {
+	return n.postTelegram(ctx, "deleteMyCommands", telegramDeleteCommandsRequest{}, nil)
 }
 
 // postTelegram 统一调用 Telegram Bot API。
@@ -659,12 +721,12 @@ func redactToken(text, token string) string {
 
 // telegramSendMessageRequest 是 Telegram sendMessage 的 JSON 请求体。
 type telegramSendMessageRequest struct {
-	ChatID                string                        `json:"chat_id"`
-	MessageThreadID       int                           `json:"message_thread_id,omitempty"`
-	Text                  string                        `json:"text"`
-	ParseMode             string                        `json:"parse_mode,omitempty"`
-	DisableWebPagePreview bool                          `json:"disable_web_page_preview"`
-	ReplyMarkup           *telegramInlineKeyboardMarkup `json:"reply_markup,omitempty"`
+	ChatID                string               `json:"chat_id"`
+	MessageThreadID       int                  `json:"message_thread_id,omitempty"`
+	Text                  string               `json:"text"`
+	ParseMode             string               `json:"parse_mode,omitempty"`
+	DisableWebPagePreview bool                 `json:"disable_web_page_preview"`
+	ReplyMarkup           *telegramReplyMarkup `json:"reply_markup,omitempty"`
 }
 
 // telegramSendChatActionRequest 是 sendChatAction 的请求体。
@@ -680,9 +742,16 @@ type telegramResponse struct {
 	Description string `json:"description"`
 }
 
-// telegramInlineKeyboardMarkup 是 Telegram 内联按钮布局。
-type telegramInlineKeyboardMarkup struct {
-	InlineKeyboard [][]TelegramInlineButton `json:"inline_keyboard"`
+// telegramReplyMarkup 是 Telegram sendMessage 的 reply_markup。
+//
+// InlineKeyboard 是消息下方按钮；Keyboard 是输入框上方的常驻键盘。
+type telegramReplyMarkup struct {
+	InlineKeyboard        [][]TelegramInlineButton   `json:"inline_keyboard,omitempty"`
+	Keyboard              [][]TelegramKeyboardButton `json:"keyboard,omitempty"`
+	ResizeKeyboard        bool                       `json:"resize_keyboard,omitempty"`
+	OneTimeKeyboard       bool                       `json:"one_time_keyboard,omitempty"`
+	IsPersistent          bool                       `json:"is_persistent,omitempty"`
+	InputFieldPlaceholder string                     `json:"input_field_placeholder,omitempty"`
 }
 
 // telegramGetUpdatesRequest 是 getUpdates 的请求体。
@@ -714,3 +783,6 @@ type telegramAnswerCallbackRequest struct {
 type telegramSetCommandsRequest struct {
 	Commands []TelegramBotCommand `json:"commands"`
 }
+
+// telegramDeleteCommandsRequest 是 deleteMyCommands 的请求体。
+type telegramDeleteCommandsRequest struct{}

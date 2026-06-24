@@ -139,7 +139,7 @@ func TestParsePriceUpdate(t *testing.T) {
 	}
 }
 
-// TestPriceButtonHelpers 验证价格按钮会生成短 callback，并能解析用户输入的 RMB/刀。
+// TestPriceButtonHelpers 验证价格按钮会生成常驻键盘文本，并能解析用户输入的 RMB/刀。
 func TestPriceButtonHelpers(t *testing.T) {
 	cfg, err := domain.NormalizeConfig(domain.Config{
 		Pools: []domain.PoolConfig{{
@@ -156,16 +156,22 @@ func TestPriceButtonHelpers(t *testing.T) {
 		t.Fatalf("NormalizeConfig returned error: %v", err)
 	}
 
-	poolKeyboard := pricePoolsKeyboard(cfg)
-	if poolKeyboard[0][0].CallbackData != "price_pool 0" {
-		t.Fatalf("pool callback = %q, want price_pool 0", poolKeyboard[0][0].CallbackData)
+	poolKeyboard := pricePoolsReplyKeyboard(cfg)
+	if poolKeyboard[0][0].Text != "Key: gpt_low / vk_low_text" {
+		t.Fatalf("pool button = %q, want key label", poolKeyboard[0][0].Text)
 	}
-	providerKeyboard := priceProvidersKeyboard(cfg.Pools[0], 0)
-	if len(providerKeyboard) != 3 {
-		t.Fatalf("provider keyboard rows = %d, want two allowed providers plus back", len(providerKeyboard))
+	if selectedKeyName("gpt_low / vk_low_text") != "gpt_low" {
+		t.Fatalf("selectedKeyName returned wrong key")
 	}
-	if providerKeyboard[1][0].CallbackData != "price_provider 0 1" {
-		t.Fatalf("provider callback = %q, want price_provider 0 1", providerKeyboard[1][0].CallbackData)
+	providerKeyboard := priceProvidersReplyKeyboard(cfg.Pools[0])
+	if len(providerKeyboard) != 4 {
+		t.Fatalf("provider keyboard rows = %d, want two allowed providers plus back/cancel", len(providerKeyboard))
+	}
+	if providerKeyboard[1][0].Text != "渠道: provider_b · 0.1 RMB/刀" {
+		t.Fatalf("provider button = %q, want provider label", providerKeyboard[1][0].Text)
+	}
+	if selectedProviderName("provider_b · 0.1 RMB/刀") != "provider_b" {
+		t.Fatalf("selectedProviderName returned wrong provider")
 	}
 	poolIndex, providerIndex, err := parseProviderCallback("0 1")
 	if err != nil {

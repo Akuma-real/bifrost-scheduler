@@ -10,7 +10,7 @@ package main
 // fmt：格式化回复文本。
 // html：转义 Telegram HTML 富文本里的运行时文本。
 // log/slog：写结构化日志。
-// strings：处理 /status、/mute 1h 这类文本命令。
+// strings：处理“状态”“静音 1h”这类按钮文本。
 // sync：用 Mutex 保护 daemonState，避免多个 goroutine 同时读写出错。
 // time：处理运行时间、静音时长、轮询超时。
 // domain：保存最近一次调度计划。
@@ -246,9 +246,13 @@ func startTelegramControl(parent context.Context, logger *slog.Logger, opts opti
 		allowedChatID: allowedChatID,
 	}
 
-	// 注册 Telegram 命令菜单。失败只记日志，不影响轮询。
-	if err := notifier.SetCommands(ctx, telegramCommands()); err != nil {
-		logger.Error("telegram command menu setup failed", "error", err)
+	// 常驻键盘是主入口，所以启动时清掉 Telegram 的 slash 命令菜单。
+	// 失败只记日志，不影响调度和长轮询。
+	if err := notifier.DeleteCommands(ctx); err != nil {
+		logger.Error("telegram command menu cleanup failed", "error", err)
+	}
+	if err := notifier.SendHTMLWithReplyKeyboard(ctx, "Bifrost 调度器控制台已启动。", mainKeyboard()); err != nil {
+		logger.Error("telegram keyboard setup failed", "error", err)
 	}
 
 	// go 表示启动一个 goroutine，也就是后台任务。
@@ -360,7 +364,11 @@ func (c telegramControl) handleUpdate(ctx context.Context, update notify.Telegra
 // handleMessage 处理用户手动发来的文本。
 func (c telegramControl) handleMessage(ctx context.Context, raw string) {
 	command, _ := splitTelegramCommand(raw)
-	if _, waitingForPrice := c.state.getPriceDraft(); waitingForPrice && !isTelegramTextCommand(command) {
+	if draft, waitingForPrice := c.state.getPriceDraft(); waitingForPrice && !isTelegramTextCommand(command) {
+		if draft.Provider == "" {
+			c.choosePriceProviderByName(ctx, raw)
+			return
+		}
 		c.previewDraftPriceUpdate(ctx, raw)
 		return
 	}
@@ -382,28 +390,36 @@ func (c telegramControl) handleCommand(ctx context.Context, raw string) {
 	switch command {
 	case "/start", "/help", "help":
 		c.reply(ctx, helpText(), mainKeyboard())
-	case "/status", "status":
+	case "/status", "status", "状态":
 		c.reply(ctx, statusText(c.state.snapshot()), mainKeyboard())
-	case "/last", "last":
+	case "/last", "last", "最近计划":
 		c.reply(ctx, lastPlanText(c.state.snapshot()), mainKeyboard())
-	case "/run", "run":
+	case "/run", "run", "立即":
 		c.runDryPlan(ctx)
-	case "/prices", "prices":
+	case "/prices", "prices", "价格":
 		c.listPrices(ctx)
+	case "调整价格":
+		c.choosePricePool(ctx, "")
 	case "price_pool":
 		c.choosePricePool(ctx, arg)
+	case "key:":
+		c.choosePricePoolByName(ctx, arg)
 	case "price_provider":
 		c.choosePriceProvider(ctx, arg)
+	case "渠道:":
+		c.choosePriceProviderByName(ctx, arg)
 	case "/price", "price":
 		c.previewPriceUpdate(ctx, arg)
-	case "/price_apply", "price_apply":
+	case "/price_apply", "price_apply", "确认写入配置":
 		c.applyPendingPrice(ctx)
-	case "/price_cancel", "price_cancel":
+	case "/price_cancel", "price_cancel", "取消":
 		c.state.clearPendingPrice()
 		c.reply(ctx, "已取消价格修改。", mainKeyboard())
-	case "/mute", "mute":
+	case "返回":
+		c.handleBack(ctx, arg)
+	case "/mute", "mute", "静音":
 		c.mute(ctx, arg)
-	case "/unmute", "unmute":
+	case "/unmute", "unmute", "恢复通知":
 		c.state.unmute()
 		c.reply(ctx, "已恢复 Telegram 变更通知。", mainKeyboard())
 	default:
@@ -459,14 +475,14 @@ func (c telegramControl) listPrices(ctx context.Context) {
 				html.EscapeString(provider.Name), html.EscapeString(price), effectiveCostWeight(provider, pool.EffectiveRules()))
 		}
 	}
-	c.reply(ctx, b.String(), pricesKeyboard(runtimeCfg))
+	c.reply(ctx, b.String(), priceListKeyboard())
 }
 
 // previewPriceUpdate 预览一次价格修改，不立即写配置。
 func (c telegramControl) previewPriceUpdate(ctx context.Context, arg string) {
 	update, err := parsePriceUpdate(arg)
 	if err != nil {
-		c.reply(ctx, "格式不对。例子：<code>/price gpt_low congmingai_openai_lv1 0.055</code>", mainKeyboard())
+		c.reply(ctx, "格式不对。请点“价格” -> “调整价格”，再选择 key 和渠道。", mainKeyboard())
 		return
 	}
 	_, preview, err := configWithPrice(c.opts.ConfigPath, update.PoolID, update.Provider, update.Price)
@@ -488,19 +504,39 @@ func (c telegramControl) choosePricePool(ctx context.Context, arg string) {
 	}
 	index, err := parseCallbackIndex(arg)
 	if err != nil {
-		c.reply(ctx, "<b>选择无效</b>\n\n请重新点“价格”。", pricesKeyboard(runtimeCfg))
+		c.reply(ctx, "<b>选择无效</b>\n\n请重新点“调整价格”。", priceListKeyboard())
 		return
 	}
 	if index < 0 {
-		c.reply(ctx, "<b>选择要调整的 key</b>", pricePoolsKeyboard(runtimeCfg))
+		c.state.setPriceDraft(priceDraft{})
+		c.reply(ctx, "<b>选择要调整的 key</b>", pricePoolsReplyKeyboard(runtimeCfg))
 		return
 	}
 	if index >= len(runtimeCfg.Pools) {
-		c.reply(ctx, "<b>选择无效</b>\n\n请重新选择 key。", pricePoolsKeyboard(runtimeCfg))
+		c.reply(ctx, "<b>选择无效</b>\n\n请重新选择 key。", pricePoolsReplyKeyboard(runtimeCfg))
 		return
 	}
 	pool := runtimeCfg.Pools[index]
-	c.reply(ctx, fmt.Sprintf("<b>选择渠道</b>\n\nKey：<code>%s</code>", html.EscapeString(pool.ID)), priceProvidersKeyboard(pool, index))
+	c.state.setPriceDraft(priceDraft{PoolID: pool.ID})
+	c.reply(ctx, fmt.Sprintf("<b>选择渠道</b>\n\nKey：<code>%s</code>", html.EscapeString(pool.ID)), priceProvidersReplyKeyboard(pool))
+}
+
+// choosePricePoolByName 处理常驻键盘里的 Key: xxx 文本。
+func (c telegramControl) choosePricePoolByName(ctx context.Context, name string) {
+	runtimeCfg, err := loadRuntimeConfig(c.opts.ConfigPath)
+	if err != nil {
+		c.reply(ctx, "<b>读取配置失败</b>\n\n<code>"+html.EscapeString(err.Error())+"</code>", mainKeyboard())
+		return
+	}
+	name = selectedKeyName(name)
+	for _, pool := range runtimeCfg.Pools {
+		if name == pool.ID || name == pool.VirtualKey {
+			c.state.setPriceDraft(priceDraft{PoolID: pool.ID})
+			c.reply(ctx, fmt.Sprintf("<b>选择渠道</b>\n\nKey：<code>%s</code>", html.EscapeString(pool.ID)), priceProvidersReplyKeyboard(pool))
+			return
+		}
+	}
+	c.reply(ctx, "<b>选择无效</b>\n\n请重新选择 key。", pricePoolsReplyKeyboard(runtimeCfg))
 }
 
 // choosePriceProvider 保存按钮选中的 provider，然后等待用户输入 RMB/刀。
@@ -512,13 +548,13 @@ func (c telegramControl) choosePriceProvider(ctx context.Context, arg string) {
 	}
 	poolIndex, providerIndex, err := parseProviderCallback(arg)
 	if err != nil || poolIndex < 0 || providerIndex < 0 || poolIndex >= len(runtimeCfg.Pools) {
-		c.reply(ctx, "<b>选择无效</b>\n\n请重新点“调整价格”。", pricePoolsKeyboard(runtimeCfg))
+		c.reply(ctx, "<b>选择无效</b>\n\n请重新点“调整价格”。", pricePoolsReplyKeyboard(runtimeCfg))
 		return
 	}
 	pool := runtimeCfg.Pools[poolIndex]
 	providers := allowedProviders(pool)
 	if providerIndex >= len(providers) {
-		c.reply(ctx, "<b>选择无效</b>\n\n请重新选择渠道。", priceProvidersKeyboard(pool, poolIndex))
+		c.reply(ctx, "<b>选择无效</b>\n\n请重新选择渠道。", priceProvidersReplyKeyboard(pool))
 		return
 	}
 	provider := providers[providerIndex]
@@ -532,6 +568,43 @@ func (c telegramControl) choosePriceProvider(ctx context.Context, arg string) {
 		html.EscapeString(provider.Name),
 		html.EscapeString(current),
 	), priceInputKeyboard())
+}
+
+// choosePriceProviderByName 处理常驻键盘里的“渠道: xxx”文本。
+func (c telegramControl) choosePriceProviderByName(ctx context.Context, name string) {
+	draft, ok := c.state.getPriceDraft()
+	if !ok || draft.PoolID == "" {
+		c.reply(ctx, "请先点“调整价格”并选择 key。", priceListKeyboard())
+		return
+	}
+	runtimeCfg, err := loadRuntimeConfig(c.opts.ConfigPath)
+	if err != nil {
+		c.reply(ctx, "<b>读取配置失败</b>\n\n<code>"+html.EscapeString(err.Error())+"</code>", mainKeyboard())
+		return
+	}
+	pool, ok := runtimePool(runtimeCfg, draft.PoolID)
+	if !ok {
+		c.reply(ctx, "<b>选择无效</b>\n\n请重新选择 key。", pricePoolsReplyKeyboard(runtimeCfg))
+		return
+	}
+	name = selectedProviderName(name)
+	for _, provider := range allowedProviders(pool) {
+		if name != provider.Name {
+			continue
+		}
+		c.state.setPriceDraft(priceDraft{PoolID: pool.ID, Provider: provider.Name})
+		current := "未填写"
+		if provider.PriceRMBPerDao > 0 {
+			current = fmt.Sprintf("%.6g RMB/刀", provider.PriceRMBPerDao)
+		}
+		c.reply(ctx, fmt.Sprintf("<b>输入新价格</b>\n\nKey：<code>%s</code>\n渠道：<code>%s</code>\n当前价格：<code>%s</code>\n\n直接发送类似 <code>0.055 RMB/刀</code> 或 <code>0.055</code>。",
+			html.EscapeString(pool.ID),
+			html.EscapeString(provider.Name),
+			html.EscapeString(current),
+		), priceInputKeyboard())
+		return
+	}
+	c.reply(ctx, "<b>选择无效</b>\n\n请重新选择渠道。", priceProvidersReplyKeyboard(pool))
 }
 
 // previewDraftPriceUpdate 把按钮选择后的普通文本当成 RMB/刀 价格。
@@ -562,7 +635,7 @@ func (c telegramControl) previewDraftPriceUpdate(ctx context.Context, raw string
 func (c telegramControl) applyPendingPrice(ctx context.Context) {
 	update, ok := c.state.getPendingPrice()
 	if !ok {
-		c.reply(ctx, "没有待确认的价格修改。先发送 <code>/price pool provider 0.055</code>。", mainKeyboard())
+		c.reply(ctx, "没有待确认的价格修改。请先点“价格”再点“调整价格”。", mainKeyboard())
 		return
 	}
 	cfg, preview, err := configWithPrice(c.opts.ConfigPath, update.PoolID, update.Provider, update.Price)
@@ -578,13 +651,29 @@ func (c telegramControl) applyPendingPrice(ctx context.Context) {
 	c.reply(ctx, "<b>价格已写入配置</b>\n\n"+pricePreviewText(preview), mainKeyboard())
 }
 
+// handleBack 处理常驻键盘里的返回按钮。
+func (c telegramControl) handleBack(ctx context.Context, arg string) {
+	switch strings.TrimSpace(arg) {
+	case "主菜单":
+		c.state.clearPendingPrice()
+		c.reply(ctx, "已返回主菜单。", mainKeyboard())
+	case "价格":
+		c.state.clearPriceDraft()
+		c.listPrices(ctx)
+	case "key":
+		c.choosePricePool(ctx, "")
+	default:
+		c.reply(ctx, "已返回主菜单。", mainKeyboard())
+	}
+}
+
 // mute 处理 /mute 命令。
 func (c telegramControl) mute(ctx context.Context, arg string) {
 	duration := time.Hour
 	if strings.TrimSpace(arg) != "" {
 		parsed, err := time.ParseDuration(strings.TrimSpace(arg))
 		if err != nil || parsed <= 0 {
-			c.reply(ctx, "静音时长格式不对。例子：<code>/mute 30m</code> 或 <code>/mute 2h</code>", mainKeyboard())
+			c.reply(ctx, "静音时长格式不对。可以直接点“静音 1h”。", mainKeyboard())
 			return
 		}
 		duration = parsed
@@ -594,8 +683,8 @@ func (c telegramControl) mute(ctx context.Context, arg string) {
 }
 
 // reply 发送 Telegram HTML 富文本回复。
-func (c telegramControl) reply(ctx context.Context, text string, keyboard [][]notify.TelegramInlineButton) {
-	if err := c.notifier.SendHTMLWithKeyboard(ctx, text, keyboard); err != nil {
+func (c telegramControl) reply(ctx context.Context, text string, keyboard [][]notify.TelegramKeyboardButton) {
+	if err := c.notifier.SendHTMLWithReplyKeyboard(ctx, text, keyboard); err != nil {
 		c.logger.Error("telegram reply failed", "error", err)
 	}
 }
@@ -656,9 +745,16 @@ func splitTelegramCommand(raw string) (string, string) {
 	return command, arg
 }
 
-// isTelegramTextCommand 判断普通文本是不是 Telegram 命令或按钮 callback。
+// isTelegramTextCommand 判断普通文本是不是 Telegram 命令或常驻键盘按钮。
 func isTelegramTextCommand(command string) bool {
-	return command != "" && (strings.HasPrefix(command, "/") || strings.Contains(command, "_") || command == "help" || command == "status" || command == "last" || command == "run" || command == "prices" || command == "price")
+	switch command {
+	case "help", "status", "last", "run", "prices", "price",
+		"状态", "最近计划", "立即", "价格", "调整价格", "key:", "渠道:",
+		"确认写入配置", "取消", "返回", "静音", "恢复通知":
+		return true
+	default:
+		return command != "" && (strings.HasPrefix(command, "/") || strings.Contains(command, "_"))
+	}
 }
 
 // telegramCommands 返回 Telegram 命令菜单。
@@ -675,20 +771,20 @@ func telegramCommands() []notify.TelegramBotCommand {
 	}
 }
 
-// mainKeyboard 返回 Telegram 消息下方的快捷按钮。
-func mainKeyboard() [][]notify.TelegramInlineButton {
-	return [][]notify.TelegramInlineButton{
+// mainKeyboard 返回 Telegram 输入框上方的常驻键盘。
+func mainKeyboard() [][]notify.TelegramKeyboardButton {
+	return [][]notify.TelegramKeyboardButton{
 		{
-			{Text: "状态", CallbackData: "status"},
-			{Text: "最近计划", CallbackData: "last"},
+			{Text: "状态"},
+			{Text: "最近计划"},
 		},
 		{
-			{Text: "立即 dry-run", CallbackData: "run"},
-			{Text: "价格", CallbackData: "prices"},
+			{Text: "立即 dry-run"},
+			{Text: "价格"},
 		},
 		{
-			{Text: "静音 1h", CallbackData: "mute 1h"},
-			{Text: "恢复通知", CallbackData: "unmute"},
+			{Text: "静音 1h"},
+			{Text: "恢复通知"},
 		},
 	}
 }
@@ -698,18 +794,14 @@ func helpText() string {
 	return strings.TrimSpace(`
 <b>Bifrost 调度器 Telegram 控制台</b>
 
-可用命令：
-<code>/status</code> - 查看 daemon 是否运行、多久跑一次、最近是否报错
-<code>/last</code> - 查看最近一次调度摘要
-<code>/run</code> - 立即执行一次 dry-run 预览，不写线上
-<code>/prices</code> - 查看当前配置里的 RMB/刀价格
-<code>/price pool provider 0.055</code> - 预览修改某个渠道价格
-<code>/mute 1h</code> - 静音变更通知，调度器仍继续运行
-<code>/unmute</code> - 恢复变更通知
-<code>/help</code> - 查看帮助
+主入口是输入框上方的常驻键盘：
+状态、最近计划、立即 dry-run、价格、静音 1h、恢复通知。
+
+调价流程：
+点“价格” -> “调整价格” -> 选择 key -> 选择渠道 -> 输入 <code>0.055 RMB/刀</code> -> 确认写入配置。
 
 安全边界：
-Telegram 价格命令只写调度器配置。真正写 Bifrost 仍只由 daemon 的 <code>config mode</code> 和 <code>--apply</code> 控制。
+Telegram 价格按钮只写调度器配置。真正写 Bifrost 仍只由 daemon 的 <code>config mode</code> 和 <code>--apply</code> 控制。
 `)
 }
 
@@ -754,7 +846,7 @@ func statusText(snapshot daemonSnapshot) string {
 // lastPlanText 把最近计划压缩成 Telegram 文本。
 func lastPlanText(snapshot daemonSnapshot) string {
 	if snapshot.lastPlan == nil {
-		return "还没有最近计划。可以点“立即 dry-run”或发送 <code>/run</code> 先跑一次预览。"
+		return "还没有最近计划。可以点“立即 dry-run”先跑一次预览。"
 	}
 	return planSummaryText("最近一次调度计划", *snapshot.lastPlan)
 }
@@ -1030,56 +1122,61 @@ func pricePreviewText(preview priceUpdatePreview) string {
 }
 
 // priceConfirmKeyboard 返回价格写入确认按钮。
-func priceConfirmKeyboard() [][]notify.TelegramInlineButton {
-	return [][]notify.TelegramInlineButton{
+func priceConfirmKeyboard() [][]notify.TelegramKeyboardButton {
+	return [][]notify.TelegramKeyboardButton{
 		{
-			{Text: "确认写入配置", CallbackData: "price_apply"},
-			{Text: "取消", CallbackData: "price_cancel"},
+			{Text: "确认写入配置"},
+			{Text: "取消"},
 		},
+		{{Text: "返回 价格"}},
 	}
 }
 
-// pricesKeyboard 返回价格列表下面的按钮。
-func pricesKeyboard(cfg domain.RuntimeConfig) [][]notify.TelegramInlineButton {
-	keyboard := [][]notify.TelegramInlineButton{
-		{{Text: "调整价格", CallbackData: "price_pool"}},
+// priceListKeyboard 返回价格列表使用的常驻键盘。
+func priceListKeyboard() [][]notify.TelegramKeyboardButton {
+	return [][]notify.TelegramKeyboardButton{
+		{{Text: "调整价格"}},
+		{{Text: "状态"}, {Text: "最近计划"}},
+		{{Text: "返回 主菜单"}},
 	}
-	return append(keyboard, mainKeyboard()...)
 }
 
-// pricePoolsKeyboard 返回 pool/key 选择按钮。
-func pricePoolsKeyboard(cfg domain.RuntimeConfig) [][]notify.TelegramInlineButton {
-	keyboard := make([][]notify.TelegramInlineButton, 0, len(cfg.Pools)+1)
-	for i, pool := range cfg.Pools {
+// pricePoolsReplyKeyboard 返回 pool/key 选择常驻键盘。
+func pricePoolsReplyKeyboard(cfg domain.RuntimeConfig) [][]notify.TelegramKeyboardButton {
+	keyboard := make([][]notify.TelegramKeyboardButton, 0, len(cfg.Pools)+2)
+	for _, pool := range cfg.Pools {
 		text := pool.ID
 		if pool.VirtualKey != "" && pool.VirtualKey != pool.ID {
 			text += " / " + pool.VirtualKey
 		}
-		keyboard = append(keyboard, []notify.TelegramInlineButton{{Text: text, CallbackData: fmt.Sprintf("price_pool %d", i)}})
+		keyboard = append(keyboard, []notify.TelegramKeyboardButton{{Text: "Key: " + text}})
 	}
-	keyboard = append(keyboard, []notify.TelegramInlineButton{{Text: "返回价格", CallbackData: "prices"}})
+	keyboard = append(keyboard, []notify.TelegramKeyboardButton{{Text: "返回 价格"}})
+	keyboard = append(keyboard, []notify.TelegramKeyboardButton{{Text: "取消"}})
 	return keyboard
 }
 
-// priceProvidersKeyboard 返回 provider 选择按钮。
-func priceProvidersKeyboard(pool domain.PoolConfig, poolIndex int) [][]notify.TelegramInlineButton {
+// priceProvidersReplyKeyboard 返回 provider 选择常驻键盘。
+func priceProvidersReplyKeyboard(pool domain.PoolConfig) [][]notify.TelegramKeyboardButton {
 	providers := allowedProviders(pool)
-	keyboard := make([][]notify.TelegramInlineButton, 0, len(providers)+1)
-	for i, provider := range providers {
+	keyboard := make([][]notify.TelegramKeyboardButton, 0, len(providers)+2)
+	for _, provider := range providers {
 		text := provider.Name
 		if provider.PriceRMBPerDao > 0 {
 			text = fmt.Sprintf("%s · %.6g RMB/刀", provider.Name, provider.PriceRMBPerDao)
 		}
-		keyboard = append(keyboard, []notify.TelegramInlineButton{{Text: text, CallbackData: fmt.Sprintf("price_provider %d %d", poolIndex, i)}})
+		keyboard = append(keyboard, []notify.TelegramKeyboardButton{{Text: "渠道: " + text}})
 	}
-	keyboard = append(keyboard, []notify.TelegramInlineButton{{Text: "返回 key", CallbackData: "price_pool"}})
+	keyboard = append(keyboard, []notify.TelegramKeyboardButton{{Text: "返回 key"}})
+	keyboard = append(keyboard, []notify.TelegramKeyboardButton{{Text: "取消"}})
 	return keyboard
 }
 
 // priceInputKeyboard 返回等待输入价格时的按钮。
-func priceInputKeyboard() [][]notify.TelegramInlineButton {
-	return [][]notify.TelegramInlineButton{
-		{{Text: "取消", CallbackData: "price_cancel"}},
+func priceInputKeyboard() [][]notify.TelegramKeyboardButton {
+	return [][]notify.TelegramKeyboardButton{
+		{{Text: "取消"}},
+		{{Text: "返回 价格"}},
 	}
 }
 
@@ -1092,6 +1189,24 @@ func allowedProviders(pool domain.PoolConfig) []domain.ProviderConfig {
 		}
 	}
 	return providers
+}
+
+// selectedKeyName 从常驻键盘按钮文本中取出真实 key。
+func selectedKeyName(text string) string {
+	text = strings.TrimSpace(text)
+	if before, _, ok := strings.Cut(text, " / "); ok {
+		return strings.TrimSpace(before)
+	}
+	return text
+}
+
+// selectedProviderName 从常驻键盘按钮文本中取出真实 provider 名。
+func selectedProviderName(text string) string {
+	text = strings.TrimSpace(text)
+	if before, _, ok := strings.Cut(text, " · "); ok {
+		return strings.TrimSpace(before)
+	}
+	return text
 }
 
 // planSummaryText 生成短计划摘要。

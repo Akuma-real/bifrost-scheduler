@@ -287,6 +287,48 @@ func TestTelegramNotifierSendsHTMLWithKeyboard(t *testing.T) {
 	}
 }
 
+// TestTelegramNotifierSendsReplyKeyboard 验证可以发送输入框上方的常驻键盘。
+func TestTelegramNotifierSendsReplyKeyboard(t *testing.T) {
+	var captured telegramSendMessageRequest
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if !strings.Contains(r.URL.Path, "/sendMessage") {
+			t.Fatalf("path = %s, want sendMessage", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+			t.Fatalf("decode telegram payload: %v", err)
+		}
+		return jsonResponse(map[string]any{"ok": true}), nil
+	})}
+
+	notifier, err := NewTelegramNotifier(TelegramConfig{
+		BotToken:   "123456:ABC",
+		ChatID:     "12345",
+		HTTPClient: client,
+	})
+	if err != nil {
+		t.Fatalf("NewTelegramNotifier returned error: %v", err)
+	}
+
+	err = notifier.SendHTMLWithReplyKeyboard(context.Background(), "<b>hello</b>", [][]TelegramKeyboardButton{
+		{{Text: "状态"}, {Text: "最近计划"}},
+	})
+	if err != nil {
+		t.Fatalf("SendHTMLWithReplyKeyboard returned error: %v", err)
+	}
+	if captured.ParseMode != TelegramParseHTML {
+		t.Fatalf("parse_mode = %q, want HTML", captured.ParseMode)
+	}
+	if captured.ReplyMarkup == nil {
+		t.Fatalf("reply_markup is nil, want reply keyboard")
+	}
+	if !captured.ReplyMarkup.IsPersistent || !captured.ReplyMarkup.ResizeKeyboard {
+		t.Fatalf("reply markup = %+v, want persistent resized keyboard", captured.ReplyMarkup)
+	}
+	if captured.ReplyMarkup.Keyboard[0][0].Text != "状态" {
+		t.Fatalf("keyboard text = %q, want 状态", captured.ReplyMarkup.Keyboard[0][0].Text)
+	}
+}
+
 // TestTelegramNotifierSendChatAction 验证 typing 状态会调用 sendChatAction。
 func TestTelegramNotifierSendChatAction(t *testing.T) {
 	var captured telegramSendChatActionRequest
@@ -472,6 +514,29 @@ func TestTelegramNotifierSetCommands(t *testing.T) {
 	}
 	if len(captured.Commands) != 1 || captured.Commands[0].Command != "status" {
 		t.Fatalf("commands = %+v, want status command", captured.Commands)
+	}
+}
+
+// TestTelegramNotifierDeleteCommands 验证可以清空 Telegram 命令菜单。
+func TestTelegramNotifierDeleteCommands(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if !strings.Contains(r.URL.Path, "/deleteMyCommands") {
+			t.Fatalf("path = %s, want deleteMyCommands", r.URL.Path)
+		}
+		return jsonResponse(map[string]any{"ok": true}), nil
+	})}
+
+	notifier, err := NewTelegramNotifier(TelegramConfig{
+		BotToken:   "123456:ABC",
+		ChatID:     "12345",
+		HTTPClient: client,
+	})
+	if err != nil {
+		t.Fatalf("NewTelegramNotifier returned error: %v", err)
+	}
+
+	if err := notifier.DeleteCommands(context.Background()); err != nil {
+		t.Fatalf("DeleteCommands returned error: %v", err)
 	}
 }
 
